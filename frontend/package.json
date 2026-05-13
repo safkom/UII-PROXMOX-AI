@@ -1,0 +1,9 @@
+{
+  "name": "ai-stack-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "echo \"Start the frontend (implement later)\" && exit 0"
+  },
+  "dependencies": {}
+}
