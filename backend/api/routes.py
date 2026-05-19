@@ -1,9 +1,11 @@
 import logging
+import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, List
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from backend.approvals.store import ApprovalStore
 from backend.config.settings import get_settings
@@ -12,6 +14,7 @@ from backend.proxmox.client import ProxmoxClient
 from backend.qdrant.snapshots import SnapshotStore
 from backend.loki.client import LokiClient
 from backend.qdrant.logs import LogStore
+from backend.execution.service import ExecutionService
 
 from .health import probe_http_service
 from .models import (
@@ -33,12 +36,15 @@ from .models import (
     ApprovalCreateRequest,
     ApprovalDecisionRequest,
     ApprovalItem,
+    ExecuteRequest,
+    ExecutionResult,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 approval_store = ApprovalStore()
+exec_service = ExecutionService()
 
 
 def collect_service_health() -> list[ServiceHealth]:
@@ -114,7 +120,7 @@ def get_infrastructure_history(limit: int = 20):
         return [
             InfrastructureHistoryItem(
                 scan_id=point.get("scan_id", ""),
-                timestamp=point.get("timestamp", datetime.utcnow()),
+                timestamp=point.get("timestamp", datetime.now(timezone.utc)),
                 container_count=point.get("container_count", 0),
                 scanned_nodes=point.get("scanned_nodes", 0),
                 diagnostics=point.get("diagnostics", []),
@@ -137,7 +143,7 @@ def get_infrastructure_history_item(scan_id: str):
             raise HTTPException(status_code=404, detail="Scan not found")
         return InfrastructureHistoryItem(
             scan_id=point.get("scan_id", scan_id),
-            timestamp=point.get("timestamp", datetime.utcnow()),
+            timestamp=point.get("timestamp", datetime.now(timezone.utc)),
             container_count=point.get("container_count", 0),
             scanned_nodes=point.get("scanned_nodes", 0),
             diagnostics=point.get("diagnostics", []),
@@ -162,7 +168,7 @@ def get_infrastructure_summary():
         history_items = [
             InfrastructureHistoryItem(
                 scan_id=point.get("scan_id", ""),
-                timestamp=point.get("timestamp", datetime.utcnow()),
+                timestamp=point.get("timestamp", datetime.now(timezone.utc)),
                 container_count=point.get("container_count", 0),
                 scanned_nodes=point.get("scanned_nodes", 0),
                 diagnostics=point.get("diagnostics", []),
@@ -191,7 +197,7 @@ def scan_infrastructure():
         snapshot_store = SnapshotStore(settings)
         snapshot_id = snapshot_store.store_scan_snapshot(
             {
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "container_count": len(container_models),
                 "containers": container_models,
                 "scanned_nodes": scan_data["scanned_nodes"],
@@ -199,7 +205,7 @@ def scan_infrastructure():
             }
         )
         return ScanResult(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             container_count=len(container_models),
             containers=container_models,
             success=True,
@@ -247,10 +253,10 @@ def chat(payload: ChatRequest):
         "You are an on-prem Proxmox homelab DevOps assistant. "
         "Answer using ONLY valid JSON with this schema: "
         '{"summary": string, "reasoning": string, "confidence": number between 0 and 1, '
-        '"suggested_actions": [{"action": string, "command": string|null, "target": string|null, "risk": "low|medium|high"}]}. '
-        "Do not include markdown. If not enough data, say so and keep confidence low. "
-        "Never claim an action was executed."
+        '"suggested_actions": [{"action": string, "command": string|null, "target": string|null, "risk": "low|medium|high"}]}'
+        " Never claim an action was executed."
     )
+    
 
     prompt = (
         f"User query:\n{payload.query}\n\n"
@@ -260,6 +266,9 @@ def chat(payload: ChatRequest):
 
     try:
         ollama_client = OllamaClient(settings)
+        # allow request to override model
+        if getattr(payload, "model", None):
+            ollama_client.model = payload.model
         model_result = ollama_client.generate_json(prompt=prompt, system_prompt=system_prompt)
     except Exception as exc:
         logger.error(f"Failed to query Ollama: {exc}")
@@ -290,7 +299,7 @@ def chat(payload: ChatRequest):
     confidence = max(0.0, min(1.0, confidence))
 
     return ChatResponse(
-        timestamp=datetime.utcnow(),
+        timestamp=datetime.now(timezone.utc),
         query=payload.query,
         summary=str(model_result.get("summary", "No summary available.")),
         reasoning=str(model_result.get("reasoning", "No reasoning provided.")),
@@ -302,6 +311,115 @@ def chat(payload: ChatRequest):
             "model": settings.ollama_model,
         },
     )
+
+
+@router.post("/chat/stream")
+def chat_stream(payload: ChatRequest):
+    settings = get_settings()
+
+    try:
+        snapshot_store = SnapshotStore(settings)
+        current_infra = snapshot_store.list_current_infrastructure()
+    except Exception as exc:
+        logger.warning(f"Failed to read infrastructure context for chat: {exc}")
+        current_infra = []
+
+    logs_context: list[dict[str, Any]] = []
+    if payload.include_logs:
+        try:
+            log_store = LogStore(settings)
+            logs_context = log_store.get_recent_logs(limit=payload.log_limit)
+        except Exception as exc:
+            logger.warning(f"Failed to read log context for chat: {exc}")
+
+    infra_brief = [
+        {
+            "name": c.get("name"),
+            "type": c.get("type"),
+            "node": c.get("node"),
+            "status": c.get("status"),
+            "ip": c.get("ip"),
+        }
+        for c in current_infra
+    ]
+
+    system_prompt = (
+        "You are an on-prem Proxmox homelab DevOps assistant. "
+        "Answer using ONLY valid JSON with this schema: "
+        '{"summary": string, "reasoning": string, "confidence": number between 0 and 1, '
+        '"suggested_actions": [{"action": string, "command": string|null, "target": string|null, "risk": "low|medium|high"}]}.'
+    )
+
+    prompt = (
+        f"User query:\n{payload.query}\n\n"
+        f"Current infrastructure ({len(infra_brief)} items):\n{infra_brief}\n\n"
+        f"Recent logs ({len(logs_context)} items):\n{logs_context}\n"
+    )
+
+    def generator():
+        full_response = ""
+        try:
+            ollama_client = OllamaClient(settings)
+            if getattr(payload, "model", None):
+                ollama_client.model = payload.model
+            for chunk in ollama_client.generate_stream(prompt=prompt, system_prompt=system_prompt):
+                try:
+                    data = json.loads(chunk)
+                except json.JSONDecodeError:
+                    continue
+
+                response_piece = data.get("response", "")
+                    # Normalize non-string pieces to string to avoid concatenation errors
+                    if response_piece is not None:
+                        if isinstance(response_piece, str):
+                            piece = response_piece
+                        else:
+                            try:
+                                piece = json.dumps(response_piece, ensure_ascii=False)
+                            except Exception:
+                                piece = str(response_piece)
+
+                        if piece:
+                            try:
+                                full_response += piece
+                            except Exception as exc:
+                                logger.exception(f"Failed to concatenate streamed piece: {exc}; coercing to str")
+                                piece = str(piece)
+                                full_response += piece
+                            yield json.dumps({"type": "chunk", "text": piece}) + "\n"
+
+                if data.get("done"):
+                    break
+
+            final_payload: dict[str, Any]
+            try:
+                parsed = json.loads(full_response)
+                final_payload = parsed if isinstance(parsed, dict) else {"summary": full_response}
+            except json.JSONDecodeError:
+                final_payload = {
+                    "summary": full_response or "No summary available.",
+                    "reasoning": "Model did not return valid JSON; using streamed text fallback.",
+                    "confidence": 0.0,
+                    "suggested_actions": [],
+                }
+            yield json.dumps({"type": "final", "payload": final_payload}) + "\n"
+        except Exception as exc:
+            logger.error(f"Streaming failed: {exc}")
+            yield json.dumps({"type": "error", "error": str(exc)}) + "\n"
+
+    return StreamingResponse(generator(), media_type="application/x-ndjson")
+
+
+@router.get("/models", response_model=List[str])
+def get_models():
+    settings = get_settings()
+    try:
+        client = OllamaClient(settings)
+        models = client.list_models()
+        return models
+    except Exception as exc:
+        logger.error(f"Failed to list models: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to list models")
 
 
 @router.post("/ingest/logs", response_model=LogIngestionResult)
@@ -390,7 +508,7 @@ def ingest_logs(request: LogIngestionRequest):
         
         return LogIngestionResult(
             batch_id=batch_id,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             total_logs_ingested=total_ingested,
             containers_processed=containers,
             success=True,
@@ -425,7 +543,7 @@ def search_logs(request: LogSearchRequest):
         
         return LogSearchResult(
             query=request.query,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             results=log_entries,
             total_results=len(log_entries),
         )
@@ -529,3 +647,49 @@ def decide_approval(approval_id: str, request: ApprovalDecisionRequest):
     except Exception as exc:
         logger.error(f"Failed to decide approval: {exc}")
         raise HTTPException(status_code=500, detail="Failed to decide approval")
+
+
+@router.post("/execute", response_model=ExecutionResult)
+def execute_command(request: ExecuteRequest):
+    """Execute an approved, validated diagnostic command locally.
+
+    Only executions tied to an approval (status == 'approved') are allowed.
+    Remote/SSH execution is not implemented in this MVP.
+    """
+    # Resolve command and approval
+    cmd = request.command
+    target = request.target
+    approval_id = request.approval_id
+
+    if approval_id:
+        existing = approval_store.get(approval_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Approval not found")
+        if existing.get("status") != "approved":
+            raise HTTPException(status_code=400, detail="Approval is not approved for execution")
+        if not cmd:
+            cmd = existing.get("command")
+            target = existing.get("target")
+    else:
+        # For safety, disallow executions without an approval record in this MVP
+        raise HTTPException(status_code=400, detail="Execution requires an approved approval_id")
+
+    if not cmd:
+        raise HTTPException(status_code=400, detail="No command available to execute")
+
+    try:
+        result = exec_service.execute(cmd, target, timeout=request.timeout)
+        return ExecutionResult(
+            approval_id=approval_id,
+            command=cmd,
+            target=target,
+            returncode=result.get("returncode", -1),
+            stdout=result.get("stdout", ""),
+            stderr=result.get("stderr", ""),
+            executed_at=datetime.now(timezone.utc),
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as exc:
+        logger.error(f"Execution failed: {exc}")
+        raise HTTPException(status_code=500, detail="Execution failed")

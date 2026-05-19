@@ -86,3 +86,34 @@ class OllamaClient:
         response = self.session.post(url, json=payload, timeout=90)
         response.raise_for_status()
         return response.json()
+
+    def generate_stream(self, prompt: str, system_prompt: str = ""):
+        """Stream raw lines from Ollama generate API (server streaming).
+
+        Yields decoded text chunks from the model as they arrive.
+        """
+        url = f"{self.base_url}/api/generate"
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "system": system_prompt,
+            "stream": True,
+            "format": "json",
+            "options": {"temperature": 0.2},
+        }
+        try:
+            resp = self.session.post(url, json=payload, stream=True, timeout=(15, None))
+            resp.raise_for_status()
+        except requests.RequestException:
+            # On failure to start streaming, re-raise to caller
+            raise
+
+        # Iterate over chunked lines
+        for raw in resp.iter_lines(decode_unicode=True):
+            if raw is None:
+                continue
+            line = raw.strip()
+            if not line:
+                continue
+            # yield the raw line so caller can decide how to display/parse
+            yield line + "\n"

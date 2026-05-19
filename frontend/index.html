@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>AI Stack — Approvals</title>
+    <style>
+      body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:20px}
+      
+      .card{border:1px solid #ddd;padding:12px;margin-bottom:8px;border-radius:6px}
+      .btn{padding:6px 10px;margin-right:6px;border:none;border-radius:4px;cursor:pointer}
+      .btn-primary{background:#0b6cff;color:#fff}
+      .btn-danger{background:#e02424;color:#fff}
+      .btn-secondary{background:#666;color:#fff}
+      pre{background:#f6f8fa;padding:8px;border-radius:4px}
+    </style>
+  </head>
+  <body>
+    <div>
+      <h2>Chat</h2>
+      <div class="card" style="max-width:1100px">
+        <div id="chat_messages" style="height:420px;overflow:auto;margin-bottom:8px;background:#fff;padding:8px;border-radius:4px"></div>
+        <div style="display:flex;gap:8px">
+          <input id="chat_input" style="flex:1;padding:8px" placeholder="Ask the assistant about your homelab..." />
+          <select id="model_select" style="width:160px;padding:6px;border-radius:4px">
+            <option value="">default model</option>
+          </select>
+          <button id="chat_send" class="btn btn-primary">Send</button>
+        </div>
+      </div>
+    </div>
+    <h3>Execution Output</h3>
+    <div id="output"><em>No output yet.</em></div>
+    
+    <script src="app.js"></script>
+  </body>
+</html>

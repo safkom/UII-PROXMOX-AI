@@ -96,6 +96,7 @@ class ChatRequest(BaseModel):
     query: str
     include_logs: bool = True
     log_limit: int = Field(20, ge=1, le=200)
+    model: str | None = None
 
 
 class SuggestedAction(BaseModel):
@@ -143,3 +144,20 @@ class ApprovalItem(BaseModel):
     review_note: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class ExecuteRequest(BaseModel):
+    approval_id: str | None = None
+    command: str | None = None
+    target: str | None = None
+    timeout: int = Field(30, ge=1)
+
+
+class ExecutionResult(BaseModel):
+    approval_id: str | None = None
+    command: str
+    target: str | None = None
+    returncode: int
+    stdout: str
+    stderr: str
+    executed_at: datetime

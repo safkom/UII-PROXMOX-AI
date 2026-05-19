@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Optional
@@ -42,7 +42,7 @@ class ApprovalStore:
             )
 
     def create(self, action: str, command: Optional[str], target: Optional[str], risk: str, source_query: Optional[str], requested_by: Optional[str]) -> dict:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         approval_id = str(uuid4())
         with self._lock:
             with self._conn:
@@ -98,7 +98,7 @@ class ApprovalStore:
             if current.get("status") != "pending":
                 return current
 
-            updated_at = datetime.utcnow().isoformat()
+            updated_at = datetime.now(timezone.utc).isoformat()
             with self._conn:
                 self._conn.execute(
                     """
