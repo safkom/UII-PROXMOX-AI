@@ -14,7 +14,7 @@ class ProxmoxClient:
 
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.base_url = settings.proxmox_url.rstrip("/")
+        self.base_url = settings.proxmox_api_base_url.rstrip("/")
         self.session = requests.Session()
         self.session.verify = settings.proxmox_verify_ssl
         self.session.headers.update({

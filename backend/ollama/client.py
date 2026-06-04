@@ -93,27 +93,49 @@ class OllamaClient:
         Yields decoded text chunks from the model as they arrive.
         """
         url = f"{self.base_url}/api/generate"
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "system": system_prompt,
-            "stream": True,
-            "format": "json",
-            "options": {"temperature": 0.2},
-        }
-        try:
-            resp = self.session.post(url, json=payload, stream=True, timeout=(15, None))
-            resp.raise_for_status()
-        except requests.RequestException:
-            # On failure to start streaming, re-raise to caller
-            raise
 
-        # Iterate over chunked lines
-        for raw in resp.iter_lines(decode_unicode=True):
-            if raw is None:
+        try_models = [self.model]
+        available_models = self.list_models()
+        if self.model not in available_models and available_models:
+            try_models.append(available_models[0])
+
+        last_error: Exception | None = None
+        for model in try_models:
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "system": system_prompt,
+                "stream": True,
+                "format": "json",
+                "options": {"temperature": 0.2},
+            }
+
+            try:
+                resp = self.session.post(url, json=payload, stream=True, timeout=(15, None))
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                last_error = exc
                 continue
-            line = raw.strip()
-            if not line:
-                continue
-            # yield the raw line so caller can decide how to display/parse
-            yield line + "\n"
+
+            resp.encoding = "utf-8"
+
+            def to_text(value):
+                if value is None:
+                    return ""
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="replace")
+                if isinstance(value, str):
+                    return value
+                return str(value)
+
+            for raw in resp.iter_lines(decode_unicode=False):
+                if raw is None:
+                    continue
+                line = to_text(raw).strip()
+                if not line:
+                    continue
+                yield line + "\n"
+            return
+
+        if last_error:
+            raise last_error

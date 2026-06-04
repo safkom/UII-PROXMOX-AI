@@ -14,6 +14,10 @@ function el(tag, props = {}, ...children) {
   return e;
 }
 
+function hasUnresolvedPlaceholder(command) {
+  return typeof command === 'string' && /<[^>]+>/.test(command);
+}
+
 async function fetchApprovals() {
   const items = await api('/approvals');
   if (Array.isArray(items)) {
@@ -68,6 +72,17 @@ async function streamChatQuery(query) {
       }
       if (event.type === 'chunk' && typeof event.text === 'string') {
         span.textContent += event.text;
+      } else if (event.type === 'tool_call') {
+        const tool = event.tool || 'unknown';
+        const args = event.args || {};
+        const action = {
+          action: typeof args.action === 'string' && args.action.trim() ? args.action.trim() : tool.replace(/_/g, ' '),
+          command: typeof args.command === 'string' && args.command.trim() ? args.command.trim() : null,
+          target: typeof args.target === 'string' && args.target.trim() ? args.target.trim() : null,
+          risk: typeof args.risk === 'string' && args.risk.trim() ? args.risk.trim() : 'medium',
+        };
+
+        await createApprovalFromAction(action, query, false);
       } else if (event.type === 'final' && event.payload) {
         finalPayload = event.payload;
       } else if (event.type === 'error' && event.error) {
@@ -129,15 +144,18 @@ function renderChatMessage(role, text) {
 }
 
 function renderApprovalInChat(item) {
+  const elId = `chat_approval_${item.id}`;
+  // Avoid rendering duplicate cards
+  if (document.getElementById(elId)) return;
+
   const container = document.getElementById('chat_messages');
-  const card = el('div', {class: 'card', id: `chat_approval_${item.id}`});
+  const card = el('div', {class: 'card', id: elId});
   card.append(el('div', {}, el('strong', {}, item.action || 'Approval request')));
   card.append(el('div', {}, `id: ${item.id} status: ${item.status}`));
   if (item.requested_by) card.append(el('div', {}, `requested_by: ${item.requested_by}`));
   if (item.risk) card.append(el('div', {}, `risk: ${item.risk}`));
   if (item.source_query) card.append(el('div', {}, `source: ${item.source_query}`));
   if (item.command) card.append(el('pre', {}, item.command));
-  
 
   const actions = el('div');
   if (item.status === 'pending') {
@@ -149,10 +167,15 @@ function renderApprovalInChat(item) {
   }
   if (item.status === 'approved' && item.command) {
     const execBtn = el('button', {class: 'btn btn-secondary'}, 'Execute');
-    execBtn.onclick = () => executeInline(item.id);
+    if (hasUnresolvedPlaceholder(item.command)) {
+      execBtn.disabled = true;
+      actions.append(el('div', {style: 'color:#a33'}, 'This approved command still contains a placeholder and cannot be executed as-is.'));
+    } else {
+      execBtn.onclick = () => executeInline(item.id);
+    }
     actions.append(execBtn);
   }
-  
+
   card.append(actions);
   container.append(card);
   container.scrollTop = container.scrollHeight;
@@ -184,7 +207,12 @@ function updateChatApprovalCard(item) {
   }
   if (item.status === 'approved' && item.command) {
     const execBtn = el('button', {class: 'btn btn-secondary'}, 'Execute');
-    execBtn.onclick = () => executeInline(item.id);
+    if (hasUnresolvedPlaceholder(item.command)) {
+      execBtn.disabled = true;
+      existing.append(el('div', {style: 'color:#a33'}, 'This approved command still contains a placeholder and cannot be executed as-is.'));
+    } else {
+      execBtn.onclick = () => executeInline(item.id);
+    }
     actions.append(execBtn);
   }
   
@@ -204,29 +232,7 @@ document.addEventListener('DOMContentLoaded', () => {
     renderChatMessage('You', q);
     input.value = '';
     try {
-      const reply = await streamChatQuery(q);
-      // after streaming completes, keep the live message and add any structured actions
-      if (reply.suggested_actions && reply.suggested_actions.length) {
-        reply.suggested_actions.forEach(act => {
-          // command preview
-          const pre = el('pre', {}, act.command ? act.command : JSON.stringify(act, null, 2));
-          const a = el('div', {style: 'margin-top:8px;border:1px solid #eee;padding:8px;border-radius:6px;background:#fafafa'},
-            el('div', {}, el('strong', {}, act.action || 'Suggested action')),
-            el('div', {}, `risk: ${act.risk || 'medium'}`),
-            pre
-          );
-
-          if (act.command) {
-            const createBtn = el('button', {class:'btn btn-primary'}, 'Create Approval');
-            createBtn.onclick = () => createApprovalFromAction(act, q, false);
-            const approveNowBtn = el('button', {class:'btn btn-secondary'}, 'Create & Approve');
-            approveNowBtn.onclick = () => createApprovalFromAction(act, q, true);
-            a.append(el('div', {style: 'margin-top:6px'}, createBtn, approveNowBtn));
-          }
-
-          document.getElementById('chat_messages').append(a);
-        });
-      }
+      await streamChatQuery(q);
     } catch (e) {
       // remove thinking and show error
       const container = document.getElementById('chat_messages');
@@ -248,7 +254,6 @@ async function createApprovalFromAction(action, source_query, autoApprove = fals
   try {
     const created = await api('/approvals', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
     await fetchApprovals();
-    // render inline in chat
     renderApprovalInChat(created);
     if (autoApprove) {
       try {
@@ -284,10 +289,25 @@ async function executeInline(id) {
     const res = await api('/execute', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({approval_id: id})});
     const card = document.getElementById(`chat_approval_${id}`);
     if (card) {
-      const out = el('pre', {}, JSON.stringify(res, null, 2));
-      card.append(el('div', {}, el('strong', {}, 'Execution result:')),
-                 out);
+      const cleanOutput = (res.stdout || '').trim();
+      const resultDiv = el('div', {style: 'margin-top:8px'});
+      resultDiv.append(el('div', {}, el('strong', {}, `Result (exit code ${res.returncode ?? 'N/A'}):`)));
+      resultDiv.append(el('pre', {}, cleanOutput || '(no output)'));
+      if (res.stderr) {
+        resultDiv.append(el('div', {}, el('strong', {}, 'Stderr:')));
+        resultDiv.append(el('pre', {}, res.stderr));
+      }
+      card.append(resultDiv);
       card.scrollIntoView({behavior:'smooth'});
+
+      // Send execution result back to AI as injected context
+      const followupQuery = `[System: The command "${res.command}" was executed on "${res.target || 'host'}". Exit code: ${res.returncode}. Output:\n${cleanOutput}]\n\nPlease briefly summarize what this output means for the user.`;
+      try {
+        const aiReply = await streamChatQuery(followupQuery);
+        // AI response is already rendered by streamChatQuery
+      } catch (aiErr) {
+        renderChatMessage('Assistant', `Error processing result: ${aiErr.message}`);
+      }
     }
     await fetchApprovals();
   } catch (e) {

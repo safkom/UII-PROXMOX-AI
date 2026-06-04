@@ -17,3 +17,5 @@ streamlit run streamlit_app.py
 ```
 
 If the backend is not on `http://127.0.0.1:8000`, set `BACKEND_URL` before launching Streamlit.
+
+For a local backend talking to a Proxmox host on another machine, set `PROXMOX_HOST_IP` and `PROXMOX_PORT` in your environment. The existing Proxmox API token settings stay the same.
