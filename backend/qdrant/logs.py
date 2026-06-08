@@ -140,8 +140,11 @@ class LogStore:
                 with_payload=True,
                 with_vectors=False,
             )
-        except Exception:
-            return []
+        except Exception as exc:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Failed to scroll logs from Qdrant collection '{self.collection_name}': {exc}")
+            raise
 
         logs = []
         for point in points[0]:

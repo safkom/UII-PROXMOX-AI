@@ -1,7 +1,10 @@
 async function api(path, opts) {
+  console.log(`[API] ${opts?.method || 'GET'} ${path}`);
   const res = await fetch(path, opts);
+  console.log(`[API] Response: ${res.status} ${res.statusText}`);
   if (!res.ok) {
     const txt = await res.text();
+    console.error(`[API] Error body: ${txt}`);
     throw new Error(`${res.status} ${res.statusText}: ${txt}`);
   }
   return res.json();
@@ -209,13 +212,13 @@ function updateChatApprovalCard(item) {
     const execBtn = el('button', {class: 'btn btn-secondary'}, 'Execute');
     if (hasUnresolvedPlaceholder(item.command)) {
       execBtn.disabled = true;
-      existing.append(el('div', {style: 'color:#a33'}, 'This approved command still contains a placeholder and cannot be executed as-is.'));
+      actions.append(el('div', {style: 'color:#a33'}, 'This approved command still contains a placeholder and cannot be executed as-is.'));
     } else {
       execBtn.onclick = () => executeInline(item.id);
     }
     actions.append(execBtn);
   }
-  
+
   existing.append(actions);
 }
 
@@ -515,6 +518,134 @@ document.getElementById('container_scan_btn').addEventListener('click', scanCont
 document.querySelector('[data-tab="tab_containers"]').addEventListener('click', () => {
   loadContainers();
 });
+
+// ===========================================================================
+// Logs tab
+// ===========================================================================
+function renderLogEntry(entry) {
+  const div = document.createElement('div');
+  div.style.cssText = 'background:#16213e;border:1px solid #333;border-radius:4px;padding:6px 8px;margin-bottom:4px;font-family:monospace;font-size:11px;line-height:1.4;word-break:break-all';
+
+  const ts = document.createElement('div');
+  ts.style.cssText = 'color:#666;font-size:10px;margin-bottom:2px';
+  ts.textContent = entry.timestamp || '';
+  div.appendChild(ts);
+
+  const container = document.createElement('span');
+  container.style.cssText = 'color:#0b6cff;font-weight:600;margin-right:6px';
+  container.textContent = entry.container || '';
+  div.appendChild(container);
+
+  const msg = document.createElement('span');
+  msg.style.cssText = 'color:#ccc';
+  msg.textContent = entry.message || '';
+  div.appendChild(msg);
+
+  return div;
+}
+
+function showLogsStatus(msg, type) {
+  const el = document.getElementById('logs_status');
+  if (!el) return;
+  el.textContent = msg;
+  el.style.color = type === 'err' ? '#f44336' : type === 'ok' ? '#4caf50' : '#888';
+}
+
+async function fetchLogs() {
+  const listEl = document.getElementById('logs_list');
+  const containerFilter = document.getElementById('logs_container_filter').value;
+  const limitVal = parseInt(document.getElementById('logs_limit').value, 10) || 50;
+  const searchQuery = document.getElementById('logs_search').value.trim();
+
+  console.log('[Logs] Fetching logs…', { containerFilter, limitVal, searchQuery });
+  showLogsStatus('Loading…');
+  listEl.innerHTML = '';
+
+  try {
+    let results;
+    if (searchQuery) {
+      const payload = { query: searchQuery, limit: limitVal };
+      if (containerFilter) payload.container = containerFilter;
+      const data = await api('/logs/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      results = data.results || [];
+    } else {
+      const params = new URLSearchParams();
+      if (containerFilter) params.set('container', containerFilter);
+      params.set('limit', String(limitVal));
+      results = await api(`/logs/recent?${params.toString()}`);
+    }
+
+    console.log('[Logs] Received', results.length, 'results');
+
+    if (!Array.isArray(results) || results.length === 0) {
+      showLogsStatus('No logs found. Logs must be ingested first (use Chat or POST /ingest/logs).');
+      listEl.innerHTML = '';
+      return;
+    }
+
+    showLogsStatus(`✓ ${results.length} log entr${results.length !== 1 ? 'ies' : 'y'} loaded`, 'ok');
+    listEl.innerHTML = '';
+    results.forEach(entry => listEl.appendChild(renderLogEntry(entry)));
+  } catch (e) {
+    console.error('[Logs] Error:', e);
+    showLogsStatus(`Error: ${e.message}`, 'err');
+    listEl.innerHTML = '';
+  }
+}
+
+async function populateLogsContainerFilter() {
+  const sel = document.getElementById('logs_container_filter');
+  // Keep the "All containers" option
+  sel.innerHTML = '<option value="">All containers</option>';
+  try {
+    const containers = await api('/containers');
+    if (Array.isArray(containers)) {
+      containers.forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c.name || String(c.vmid);
+        opt.textContent = `${c.name || c.vmid} (${c.type || '?'}, ${c.node || '?'})`;
+        sel.appendChild(opt);
+      });
+    }
+  } catch (e) {
+    // Silently ignore — container filter is optional
+  }
+}
+
+// Logs fetch button
+const logsFetchBtn = document.getElementById('logs_fetch_btn');
+if (logsFetchBtn) {
+  logsFetchBtn.addEventListener('click', () => {
+    console.log('[Logs] Fetch button clicked');
+    fetchLogs();
+  });
+} else {
+  console.error('[Logs] Could not find logs_fetch_btn element');
+}
+
+// Logs search Enter key
+const logsSearch = document.getElementById('logs_search');
+if (logsSearch) {
+  logsSearch.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') fetchLogs();
+  });
+}
+
+// Auto-load logs and container filter when switching to that tab
+const logsTabBtn = document.querySelector('[data-tab="tab_logs"]');
+if (logsTabBtn) {
+  logsTabBtn.addEventListener('click', () => {
+    console.log('[Logs] Logs tab clicked');
+    populateLogsContainerFilter();
+    fetchLogs();
+  });
+} else {
+  console.error('[Logs] Could not find tab_logs button');
+}
 
 // ===========================================================================
 // Init

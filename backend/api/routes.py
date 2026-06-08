@@ -782,6 +782,8 @@ def get_recent_logs(container: str | None = None, limit: int = 100):
         log_store = LogStore(settings)
         results = log_store.get_recent_logs(container=container, limit=limit)
         
+        logger.info(f"Returning {len(results)} recent logs (container={container}, limit={limit})")
+        
         return [
             LogEntry(
                 timestamp=r["timestamp"],
@@ -793,7 +795,7 @@ def get_recent_logs(container: str | None = None, limit: int = 100):
         ]
     except Exception as exc:
         logger.error(f"Failed to get recent logs: {exc}")
-        raise HTTPException(status_code=500, detail="Failed to get recent logs")
+        raise HTTPException(status_code=500, detail=f"Failed to get recent logs: {exc}")
 
 
 @router.post("/approvals", response_model=ApprovalItem)

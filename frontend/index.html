@@ -79,6 +79,7 @@
         <div class="sidebar-tabs">
           <button class="tab-btn active" data-tab="tab_settings">⚙ Settings</button>
           <button class="tab-btn" data-tab="tab_containers">🖥 Containers</button>
+          <button class="tab-btn" data-tab="tab_logs">📋 Logs</button>
         </div>
         <button id="settings_close" class="close-btn" title="Close sidebar">✕</button>
       </div>
@@ -182,6 +183,23 @@
         <div id="container_count" class="container-count"></div>
         <div id="container_list"></div>
       </div>
+      <!-- Logs Tab -->
+      <div class="sidebar-body tab-content" id="tab_logs">
+        <div class="sec-title">Filter</div>
+        <label for="logs_container_filter">Container</label>
+        <select id="logs_container_filter">
+          <option value="">All containers</option>
+        </select>
+        <label for="logs_limit">Limit</label>
+        <input id="logs_limit" type="number" value="50" min="1" max="500" />
+        <label for="logs_search">Search (optional)</label>
+        <input id="logs_search" type="text" placeholder="Search logs…" />
+        <div style="display:flex;gap:8px;margin-top:4px">
+          <button id="logs_fetch_btn" class="btn-scan" style="flex:1;padding:8px;font-size:13px;font-weight:600;border:none;border-radius:4px;cursor:pointer">🔍 Fetch Logs</button>
+        </div>
+        <div id="logs_status" style="font-size:12px;color:#888;min-height:18px;margin-bottom:4px"></div>
+        <div id="logs_list" style="max-height:calc(100vh - 400px);overflow-y:auto;font-size:12px"></div>
+      </div>
       <div id="settings_msg" class="sidebar-msg"></div>
       <div class="sidebar-footer">
         <button id="settings_save" class="btn-save">Save</button>
@@ -209,6 +227,6 @@
       <div id="output"><em>No output yet.</em></div>
     </div>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=2"></script>
   </body>
 </html>

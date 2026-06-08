@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 from typing import Optional
 from uuid import uuid4
 
@@ -15,7 +15,7 @@ class ApprovalStore:
         settings = get_settings()
         self.db_path = Path(db_path or settings.approval_db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = Lock()
+        self._lock = RLock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._initialize()
