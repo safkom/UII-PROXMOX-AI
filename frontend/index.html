@@ -4,10 +4,26 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Proxmox AI — Homelab Control</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
+      /* ═══════════════════════════════════════════════════════════════
+         Self-hosted fonts — the assistant runs on an offline LAN, so no
+         CDN dependency. Variable fonts cover all used weights.
+         ═══════════════════════════════════════════════════════════════ */
+      @font-face {
+        font-family: 'Inter';
+        font-style: normal;
+        font-weight: 100 900;
+        font-display: swap;
+        src: url('fonts/inter-latin-wght-normal.woff2') format('woff2-variations');
+      }
+      @font-face {
+        font-family: 'JetBrains Mono';
+        font-style: normal;
+        font-weight: 100 800;
+        font-display: swap;
+        src: url('fonts/jetbrains-mono-latin-wght-normal.woff2') format('woff2-variations');
+      }
+
       /* ═══════════════════════════════════════════════════════════════
          CSS Custom Properties & Reset
          ═══════════════════════════════════════════════════════════════ */
@@ -39,7 +55,7 @@
         --text-primary: #f1f5f9;
         --text-secondary: #94a3b8;
         --text-muted: #64748b;
-        --text-faint: #475569;
+        --text-faint: #7a8aa0; /* keeps small labels above WCAG AA contrast on the dark bg */
         --radius-sm: 6px;
         --radius-md: 10px;
         --radius-lg: 14px;
@@ -66,6 +82,13 @@
         color: var(--text-primary);
         -webkit-font-smoothing: antialiased;
         -moz-osx-font-smoothing: grayscale;
+      }
+
+      /* Visible focus for keyboard navigation */
+      :focus-visible {
+        outline: 2px solid var(--accent-primary);
+        outline-offset: 2px;
+        border-radius: var(--radius-sm);
       }
 
       ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -718,6 +741,7 @@
       .container-meta .label {
         color: var(--text-faint);
         font-size: 11px;
+        font-weight: 500;
         text-transform: uppercase;
         letter-spacing: 0.04em;
       }
@@ -743,7 +767,7 @@
       }
 
       .logs-toolbar .field label {
-        font-size: 10px;
+        font-size: 11px;
         color: var(--text-faint);
         font-weight: 600;
         text-transform: uppercase;
@@ -1021,7 +1045,7 @@
       }
 
       .settings-section-title {
-        font-size: 10px;
+        font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.1em;
         color: var(--accent-primary);
@@ -1153,26 +1177,26 @@
     <!-- ═══ Sidebar ═══ -->
     <div id="sidebar">
       <div class="sidebar-logo">P</div>
-      <button class="nav-btn active" data-view="view_chat" title="Chat">
+      <button class="nav-btn active" data-view="view_chat" title="Chat" aria-label="Chat">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
         <span class="tooltip">Chat</span>
       </button>
-      <button class="nav-btn" data-view="view_containers" title="Containers">
+      <button class="nav-btn" data-view="view_containers" title="Containers" aria-label="Containers">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
         <span class="tooltip">Containers</span>
       </button>
-      <button class="nav-btn" data-view="view_logs" title="Logs">
+      <button class="nav-btn" data-view="view_logs" title="Logs" aria-label="Logs">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
         <span class="tooltip">Logs</span>
       </button>
-      <button class="nav-btn" data-view="view_recommendations" title="Recommendations">
+      <button class="nav-btn" data-view="view_recommendations" title="Recommendations" aria-label="Recommendations">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
         <span class="badge" id="rec_badge" style="display:none">0</span>
         <span class="tooltip">Recommendations</span>
       </button>
       <div class="sidebar-spacer"></div>
       <div class="sidebar-divider"></div>
-      <button class="nav-btn" data-view="view_settings" title="Settings">
+      <button class="nav-btn" data-view="view_settings" title="Settings" aria-label="Settings">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         <span class="tooltip">Settings</span>
       </button>
@@ -1387,7 +1411,17 @@
           </div>
           <div class="settings-field">
             <label for="cfg_ollama_model">Default Model</label>
-            <input id="cfg_ollama_model" type="text" placeholder="llama3.1:8b" />
+            <input id="cfg_ollama_model" type="text" placeholder="gemma4:e4b" />
+          </div>
+          <div class="settings-field-row">
+            <div class="settings-field">
+              <label for="cfg_ollama_embed_model">Embedding Model</label>
+              <input id="cfg_ollama_embed_model" type="text" placeholder="nomic-embed-text" />
+            </div>
+            <div class="settings-field">
+              <label for="cfg_ollama_num_ctx">Context Tokens</label>
+              <input id="cfg_ollama_num_ctx" type="number" placeholder="4096" />
+            </div>
           </div>
         </div>
         <div class="settings-section">
@@ -1409,6 +1443,10 @@
               <label for="cfg_qdrant_history_collection_name">History Collection</label>
               <input id="cfg_qdrant_history_collection_name" type="text" />
             </div>
+          </div>
+          <div class="settings-field">
+            <label for="cfg_qdrant_logs_collection_name">Logs Collection</label>
+            <input id="cfg_qdrant_logs_collection_name" type="text" placeholder="logs_current" />
           </div>
         </div>
         <div class="settings-section">
@@ -1440,6 +1478,6 @@
       </div>
     </div>
 
-    <script src="app.js?v=6"></script>
+    <script src="app.js?v=7"></script>
   </body>
 </html>

@@ -78,64 +78,58 @@ def get_tool_definitions() -> list[dict]:
 # ------------------------------------------------------------------
 
 class OllamaClient:
-    """Client for Ollama using the OpenAI-compatible /v1/chat/completions API."""
+    """Client for the native Ollama /api/chat endpoint.
+
+    The native endpoint (unlike the OpenAI-compatible /v1/chat/completions)
+    honors the `options` field, which is the only way to set num_ctx per
+    request — essential for keeping context predictable on small hardware.
+    """
 
     def __init__(self, settings: Settings):
         self.base_url = settings.ollama_url.rstrip("/")
         self.model = settings.ollama_model
+        self.num_ctx = getattr(settings, "ollama_num_ctx", 4096)
         self.session = requests.Session()
 
     def _chat(self, messages: list[dict], tools: list[dict] | None = None, stream: bool = False):
-        """Call /v1/chat/completions and return the parsed response."""
-        url = f"{self.base_url}/v1/chat/completions"
+        """Call /api/chat. Returns the message dict (non-stream) or the Response (stream)."""
+        url = f"{self.base_url}/api/chat"
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "stream": stream,
-            "options": {"temperature": 0.2,
-                        "num_ctx": 8192},
+            "options": {"temperature": 0.2, "num_ctx": self.num_ctx},
         }
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
 
         if stream:
             resp = self.session.post(url, json=payload, stream=True, timeout=(15, None))
             resp.raise_for_status()
             resp.encoding = "utf-8"
             return resp
-        else:
-            resp = self.session.post(url, json=payload, timeout=120)
-            resp.raise_for_status()
-            return resp.json()
+        resp = self.session.post(url, json=payload, timeout=300)
+        resp.raise_for_status()
+        return resp.json().get("message", {})
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict[str, Any]:
         """Send messages to the LLM with tools, loop through tool_calls, return final answer.
 
-        Supports OpenAI-style tool_calls and various text-based tool call formats
-        (Gemma, Llama, Mistral, etc.).
+        Supports native Ollama tool_calls plus text-based tool call formats
+        that small models (Gemma, Llama, Mistral) sometimes fall back to.
         """
         history = list(messages)
         max_rounds = 5
 
         for round_num in range(max_rounds):
-            resp = self._chat(history, tools=tools, stream=False)
-            if not isinstance(resp, dict):
-                raise RuntimeError("Unexpected non-dict response from Ollama")
-
-            choice = resp.get("choices", [{}])[0]
-            msg = choice.get("message", {})
+            msg = self._chat(history, tools=tools, stream=False)
             content = msg.get("content", "") or ""
 
             logger.debug(f"LLM round {round_num}: content={content[:200]!r}, tool_calls={msg.get('tool_calls')}")
 
-            # Append the assistant message
             history.append(msg)
 
-            # 1) Check OpenAI-style tool_calls (Llama, Qwen, etc.)
-            tool_calls = self._extract_openai_tool_calls(msg)
-
-            # 2) If no tool_calls, try parsing text-based formats from content
+            tool_calls = self._extract_native_tool_calls(msg)
             if not tool_calls:
                 tool_calls = self._parse_text_tool_calls(content)
 
@@ -144,26 +138,8 @@ class OllamaClient:
                 return self._parse_content(content)
 
             logger.info(f"Executing tool calls: {[tc.get('name') for tc in tool_calls]}")
-
-            # Execute each tool call and append results
             for tc in tool_calls:
-                tool_name = tc.get("name", "")
-                tool_args = tc.get("args", {})
-                if isinstance(tool_args, str):
-                    try:
-                        tool_args = json.loads(tool_args)
-                    except json.JSONDecodeError:
-                        tool_args = {}
-
-                result = run_tool(tool_name, tool_args)
-                tool_content = self._format_tool_result(tool_name, result)
-
-                history.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id", ""),
-                    "name": tool_name,
-                    "content": tool_content,
-                })
+                history.append(self._run_tool_call(tc))
 
         content = history[-1].get("content", "") if history else ""
         return self._parse_content(content)
@@ -175,104 +151,76 @@ class OllamaClient:
 
         for round_num in range(max_rounds):
             resp = self._chat(history, tools=tools, stream=True)
-            if not isinstance(resp, requests.Response):
-                raise RuntimeError("Unexpected response type from Ollama stream")
 
             content = ""
-            tool_calls_dict = {}
-            msg_role = "assistant"
-            
+            raw_tool_calls: list[dict] = []
+
             for raw in resp.iter_lines(decode_unicode=False):
                 if not raw:
                     continue
-                line = raw.decode("utf-8", errors="replace")
-                if not line.strip():
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
                     continue
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]":
-                        continue
-                    try:
-                        data = json.loads(data_str)
-                        delta = data.get("choices", [{}])[0].get("delta", {})
-                        
-                        if "role" in delta:
-                            msg_role = delta["role"]
-                        
-                        if "tool_calls" in delta:
-                            for tc in delta["tool_calls"]:
-                                idx = tc.get("index")
-                                if idx not in tool_calls_dict:
-                                    tool_calls_dict[idx] = {"id": tc.get("id", ""), "type": "function", "function": {"name": "", "arguments": ""}}
-                                if "id" in tc and tc["id"]:
-                                    tool_calls_dict[idx]["id"] = tc["id"]
-                                if "function" in tc:
-                                    if "name" in tc["function"] and tc["function"]["name"]:
-                                        tool_calls_dict[idx]["function"]["name"] += tc["function"]["name"]
-                                    if "arguments" in tc["function"] and tc["function"]["arguments"]:
-                                        tool_calls_dict[idx]["function"]["arguments"] += tc["function"]["arguments"]
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-                        if "content" in delta and delta["content"]:
-                            chunk = delta["content"]
-                            content += chunk
-                            yield {"type": "content_chunk", "text": chunk}
-                    except json.JSONDecodeError:
-                        pass
-                else:
-                    try:
-                        data = json.loads(line)
-                        if "message" in data:
-                            chunk = data["message"].get("content", "")
-                            if chunk:
-                                content += chunk
-                                yield {"type": "content_chunk", "text": chunk}
-                    except json.JSONDecodeError:
-                        pass
+                msg_part = data.get("message", {})
+                if msg_part.get("tool_calls"):
+                    raw_tool_calls.extend(msg_part["tool_calls"])
+                chunk = msg_part.get("content", "")
+                if chunk:
+                    content += chunk
+                    yield {"type": "content_chunk", "text": chunk}
+                if data.get("done"):
+                    break
 
-            msg = {"role": msg_role, "content": content}
-            if tool_calls_dict:
-                msg["tool_calls"] = list(tool_calls_dict.values())
-                
+            msg: dict[str, Any] = {"role": "assistant", "content": content}
+            if raw_tool_calls:
+                msg["tool_calls"] = raw_tool_calls
             history.append(msg)
-            
-            tool_calls = self._extract_openai_tool_calls(msg)
+
+            tool_calls = self._extract_native_tool_calls(msg)
             if not tool_calls:
                 tool_calls = self._parse_text_tool_calls(content)
-                
+
             if not tool_calls:
                 yield {"type": "final_answer", "content": content}
                 return
 
             for tc in tool_calls:
                 yield {"type": "tool_call", "name": tc.get("name"), "args": tc.get("args")}
-                
-            for tc in tool_calls:
-                tool_name = tc.get("name", "")
-                tool_args = tc.get("args", {})
-                if isinstance(tool_args, str):
-                    try:
-                        tool_args = json.loads(tool_args)
-                    except json.JSONDecodeError:
-                        tool_args = {}
 
-                result = run_tool(tool_name, tool_args)
-                tool_content = self._format_tool_result(tool_name, result)
-                
-                history.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id", ""),
-                    "name": tool_name,
-                    "content": tool_content,
-                })
-                yield {"type": "tool_result", "name": tool_name, "result": tool_content}
+            for tc in tool_calls:
+                tool_message = self._run_tool_call(tc)
+                history.append(tool_message)
+                yield {"type": "tool_result", "name": tc.get("name"), "result": tool_message["content"]}
 
         content = history[-1].get("content", "") if history else ""
         yield {"type": "final_answer", "content": content}
 
+    @staticmethod
+    def _run_tool_call(tc: dict) -> dict:
+        """Execute one tool call and return the tool-role message for the history."""
+        tool_name = tc.get("name", "")
+        tool_args = tc.get("args", {})
+        if isinstance(tool_args, str):
+            try:
+                tool_args = json.loads(tool_args)
+            except json.JSONDecodeError:
+                tool_args = {}
+
+        result = run_tool(tool_name, tool_args)
+        return {
+            "role": "tool",
+            "tool_name": tool_name,
+            "content": OllamaClient._format_tool_result(tool_name, result),
+        }
 
     @staticmethod
-    def _extract_openai_tool_calls(msg: dict) -> list[dict]:
-        """Extract tool calls from the OpenAI-format message field."""
+    def _extract_native_tool_calls(msg: dict) -> list[dict]:
+        """Extract tool calls from an Ollama message. Arguments may be a dict or a JSON string."""
         raw_calls = msg.get("tool_calls")
         if not raw_calls:
             return []
@@ -469,36 +417,6 @@ class OllamaClient:
         if len(text) > 2000:
             return text[:2000] + "...(truncated)"
         return text
-
-    def stream_chat(self, messages: list[dict], tools: list[dict] | None = None):
-        """Stream the LLM response as SSE lines (no tool loop)."""
-        resp = self._chat(messages, tools=tools, stream=True)
-        if not isinstance(resp, requests.Response):
-            raise RuntimeError("Unexpected response type from Ollama stream")
-
-        for raw in resp.iter_lines(decode_unicode=False):
-            if raw is None:
-                continue
-            line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
-            if not line.strip():
-                continue
-            yield line + "\n"
-
-    def generate_json(self, prompt: str, system_prompt: str = "") -> dict[str, Any]:
-        """Legacy: generate structured JSON output (no tool support)."""
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-        return self.chat(messages, tools=None)
-
-    def generate_stream(self, prompt: str, system_prompt: str = ""):
-        """Legacy: stream raw lines from Ollama (no tool support)."""
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-        yield from self.stream_chat(messages, tools=None)
 
     @staticmethod
     def _parse_content(content: str) -> dict[str, Any]:

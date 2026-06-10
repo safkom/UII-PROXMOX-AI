@@ -35,9 +35,12 @@ class Settings(BaseSettings):
     qdrant_history_collection_name: str = Field(
         "infrastructure_history",
     )
+    qdrant_logs_collection_name: str = Field("logs_current")
 
     ollama_url: str = Field(...)
-    ollama_model: str = Field("llama3.1:8b")
+    ollama_model: str = Field("gemma4:e4b")
+    ollama_embed_model: str = Field("nomic-embed-text")
+    ollama_num_ctx: int = Field(4096)
     loki_url: str = Field(...)
     prometheus_url: str = Field(...)
     approval_db_path: str = Field("data/approvals.sqlite3")

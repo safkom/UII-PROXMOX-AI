@@ -2,7 +2,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Optional
+from typing import List, Optional
 from uuid import uuid4
 
 from backend.config.settings import get_settings
@@ -109,6 +109,49 @@ class ApprovalStore:
                     (decision, reviewer, note, updated_at, approval_id),
                 )
             return self.get(approval_id)
+
+    def mark_executed(self, approval_id: str, note: Optional[str] = None) -> Optional[dict]:
+        """Mark an approved item as executed so it cannot be re-run from the UI."""
+        with self._lock:
+            current = self.get(approval_id)
+            if not current:
+                return None
+            updated_at = datetime.now(timezone.utc).isoformat()
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE approvals SET status = 'executed', review_note = COALESCE(?, review_note), updated_at = ? WHERE id = ?",
+                    (note, updated_at, approval_id),
+                )
+            return self.get(approval_id)
+
+    def delete(self, approval_id: str) -> bool:
+        with self._lock:
+            with self._conn:
+                cur = self._conn.execute("DELETE FROM approvals WHERE id = ?", (approval_id,))
+        return cur.rowcount > 0
+
+    # NB: `List` from typing because the `list` builtin is shadowed by the
+    # `list()` method above within this class body.
+    def cleanup(self, remove_empty: bool = True, action: Optional[str] = None, statuses: Optional[List[str]] = None) -> int:
+        """Delete approvals matching the given filters. Returns the number deleted."""
+        clauses: list[str] = []
+        params: list = []
+        if remove_empty:
+            clauses.append("(command IS NULL OR trim(command) = '')")
+        if action:
+            clauses.append("action = ?")
+            params.append(action)
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        if not clauses:
+            return 0
+        query = "DELETE FROM approvals WHERE " + " OR ".join(clauses)
+        with self._lock:
+            with self._conn:
+                cur = self._conn.execute(query, params)
+        return cur.rowcount
 
     @staticmethod
     def _row_to_item(row: sqlite3.Row | None) -> Optional[dict]:

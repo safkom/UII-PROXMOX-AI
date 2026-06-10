@@ -39,6 +39,18 @@ class ExecutionService:
 
     BLOCKED = {"rm", "sudo", "shutdown", "reboot", "chmod", "chown", "apt"}
 
+    # Binaries whose subcommands range from diagnostics to destruction
+    # (e.g. `pct destroy`, `systemctl poweroff`) get a subcommand allowlist.
+    ALLOWED_SUBCOMMANDS = {
+        "pct": {"list", "config", "status", "start", "stop"},
+        "qm": {"list", "config", "status", "start", "stop"},
+        "pvesh": {"get", "ls"},
+        "systemctl": {
+            "status", "show", "cat", "is-active", "is-enabled", "is-failed",
+            "list-units", "list-unit-files", "start", "stop", "restart",
+        },
+    }
+
     SHELL_DANGERS = re.compile(r"[;&|`$<>]")
 
     def validate(self, command: str) -> list[str]:
@@ -66,6 +78,15 @@ class ExecutionService:
 
         if head not in self.ALLOWED:
             raise ValueError(f"Command '{head}' is not in the allowed commands")
+
+        allowed_subcommands = self.ALLOWED_SUBCOMMANDS.get(head)
+        if allowed_subcommands is not None:
+            subcommand = parts[1] if len(parts) > 1 else ""
+            if subcommand not in allowed_subcommands:
+                raise ValueError(
+                    f"'{head} {subcommand}'".strip()
+                    + f" is not an allowed subcommand (allowed: {', '.join(sorted(allowed_subcommands))})"
+                )
 
         return parts
 

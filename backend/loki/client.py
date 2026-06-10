@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
@@ -33,9 +33,9 @@ class LokiClient:
             dict with 'status', 'data' (list of log streams)
         """
         if start_time is None:
-            start_time = datetime.utcnow() - timedelta(hours=1)
+            start_time = datetime.now(timezone.utc) - timedelta(hours=1)
         if end_time is None:
-            end_time = datetime.utcnow()
+            end_time = datetime.now(timezone.utc)
 
         # Convert to nanoseconds for Loki
         start_ns = int(start_time.timestamp() * 1e9)
@@ -71,7 +71,7 @@ class LokiClient:
             List of log entries with timestamp, message, container
         """
         query = f'{{container="{container_name}"}}'
-        start_time = datetime.utcnow() - timedelta(minutes=since_minutes)
+        start_time = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
 
         try:
             result = self.query_range(query, start_time=start_time, limit=limit)
@@ -83,7 +83,7 @@ class LokiClient:
         if result.get("status") == "success" and result.get("data"):
             for stream in result["data"].get("result", []):
                 for timestamp_ns, message in stream.get("values", []):
-                    ts = datetime.fromtimestamp(int(timestamp_ns) / 1e9)
+                    ts = datetime.fromtimestamp(int(timestamp_ns) / 1e9, tz=timezone.utc)
                     logs.append(
                         {
                             "timestamp": ts.isoformat(),
@@ -111,7 +111,7 @@ class LokiClient:
         Returns:
             List of log entries
         """
-        start_time = datetime.utcnow() - timedelta(minutes=since_minutes)
+        start_time = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
 
         try:
             result = self.query_range(label_query, start_time=start_time, limit=limit)
@@ -123,7 +123,7 @@ class LokiClient:
             for stream in result["data"].get("result", []):
                 labels = stream.get("stream", {})
                 for timestamp_ns, message in stream.get("values", []):
-                    ts = datetime.fromtimestamp(int(timestamp_ns) / 1e9)
+                    ts = datetime.fromtimestamp(int(timestamp_ns) / 1e9, tz=timezone.utc)
                     logs.append(
                         {
                             "timestamp": ts.isoformat(),

@@ -53,17 +53,13 @@ function parseMarkdown(text) {
   return html;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Recommendations Badge
-// ═══════════════════════════════════════════════════════════════════════════
-
-function updateRecBadge() {
-  const pending = document.querySelectorAll('.rec-pending').length;
-  const badge = document.getElementById('rec_badge');
-  if (badge) {
-    badge.textContent = pending;
-    badge.style.display = pending > 0 ? 'flex' : 'none';
-  }
+// Keep command output short when feeding it back to the model — a journalctl
+// dump can be tens of thousands of tokens, which the local model can't afford.
+function truncateForPrompt(text, max = 1500) {
+  if (!text || text.length <= max) return text;
+  const head = text.slice(0, Math.floor(max * 0.67));
+  const tail = text.slice(-Math.floor(max * 0.33));
+  return `${head}\n...[output truncated]...\n${tail}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -71,69 +67,122 @@ function updateRecBadge() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const chatHistory = [];
+const MAX_HISTORY = 10;
+let lastUserQuery = '';
 
 function getChatHistory() {
-  return chatHistory.map(m => ({ role: m.role, content: m.content }));
+  return chatHistory.slice(-MAX_HISTORY).map(m => ({ role: m.role, content: m.content }));
 }
 
-async function sendChatQuery(query) {
-  chatHistory.push({ role: 'user', content: query });
-  const modelEl = document.getElementById('model_select');
-  const model = modelEl ? modelEl.value || null : null;
-  const payload = { query, include_logs: true, log_limit: 20, model, history: getChatHistory() };
-  return api('/chat', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-}
+const _renderedActionKeys = new Set();
 
-const _renderedToolCallIds = new Set();
+// Render one suggested action in chat: create a pending approval, then offer
+// Approve & Run / Reject. Execution only ever happens through /execute with an
+// approved approval id.
+async function handleSuggestedAction(action, container) {
+  const cmd = action.command || '';
+  const label = action.action || 'Suggested action';
+  const risk = action.risk || 'medium';
 
-function handleToolCallEvent(event, container) {
-  const args = event.args || {};
-  const cmd = args.command || '';
-  const action = args.action || 'command';
-  const risk = args.risk || 'medium';
-  const dedupKey = `${action}::${cmd}`;
-  if (_renderedToolCallIds.has(dedupKey)) return;
-  _renderedToolCallIds.add(dedupKey);
+  const dedupKey = `${label}::${cmd}`;
+  if (_renderedActionKeys.has(dedupKey)) return;
+  _renderedActionKeys.add(dedupKey);
 
   if (!isShellCommand(cmd)) {
     if (!cmd) {
-      container.append(el('div', {class: 'tool-result'}, `Suggested: ${action}`));
+      container.append(el('div', {class: 'tool-result'}, `Suggested: ${label}`));
       container.scrollTop = container.scrollHeight;
     }
     return;
   }
 
+  let approval;
+  try {
+    approval = await api('/approvals', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+      action: label,
+      command: cmd,
+      target: action.target || null,
+      risk,
+      source_query: lastUserQuery,
+      requested_by: 'assistant',
+    })});
+  } catch (e) {
+    renderChatMessage('system', `Failed to create approval request: ${e.message}`);
+    return;
+  }
+  fetchApprovals();
+
   const actionDiv = el('div', {style:'margin-top:8px;padding:12px 14px;background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.15);border-radius:10px;'});
-  actionDiv.append(el('div', {style:'font-size:11px;color:var(--text-muted);margin-bottom:4px;'}, `Suggested: ${action}`));
+  actionDiv.append(el('div', {style:'font-size:11px;color:var(--text-muted);margin-bottom:4px;'}, `Awaiting your approval: ${label}`));
   actionDiv.append(el('div', {class: 'rec-command', style:'margin:0 0 8px 0;'}, cmd));
-  const execBtn = el('button', {class: 'btn btn-primary btn-sm'}, 'Execute');
-  execBtn.onclick = async () => {
-    actionDiv.remove();
+  actionDiv.append(el('span', {class: `rec-tag risk-${risk === 'low' ? 'low' : risk === 'high' ? 'high' : 'medium'}`, style:'margin-right:8px;'}, `risk: ${risk}`));
+
+  const approveBtn = el('button', {class: 'btn btn-success btn-sm'}, '✓ Approve & Run');
+  const rejectBtn = el('button', {class: 'btn btn-danger btn-sm', style:'margin-left:6px;'}, '✕ Reject');
+
+  approveBtn.onclick = async () => {
+    approveBtn.disabled = true;
+    rejectBtn.disabled = true;
     try {
-      const res = await api('/execute/direct', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({command: cmd, risk})});
-      const cleanOutput = (res.stdout || '').trim();
-      const stderrOutput = (res.stderr || '').trim();
-      const fullOutput = stderrOutput ? `${cleanOutput}\n\nError output:\n${stderrOutput}`.trim() : cleanOutput;
-      
-      renderChatMessage('system', `Executed \`${cmd}\` (exit ${res.returncode}):\n${fullOutput || '(no output)'}`);
-      const followupQuery = `[System: The command "${cmd}" was executed. Exit code: ${res.returncode}. Output:\n${fullOutput}]\n\nPlease briefly summarize what this output means for the user.`;
-      try { await streamChatQuery(followupQuery); } catch (_) {}
+      await api(`/approvals/${approval.id}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({decision: 'approved', reviewer: 'web-ui', note: 'approved via chat'})});
+      const res = await api('/execute', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({approval_id: approval.id})});
+      actionDiv.remove();
+      rememberExecution(approval.id, res);
+      await reportExecution(res);
     } catch (e) {
+      actionDiv.remove();
       renderChatMessage('system', `Execution failed: ${e.message}`);
       const followupQuery = `[System: The command "${cmd}" failed to execute. Error: ${e.message}]\n\nPlease explain why this failed and suggest a fix if possible.`;
       try { await streamChatQuery(followupQuery); } catch (_) {}
+    } finally {
+      fetchApprovals();
     }
   };
-  actionDiv.append(execBtn);
+
+  rejectBtn.onclick = async () => {
+    approveBtn.disabled = true;
+    rejectBtn.disabled = true;
+    try {
+      await api(`/approvals/${approval.id}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({decision: 'rejected', reviewer: 'web-ui', note: 'rejected via chat'})});
+    } catch (e) {
+      renderChatMessage('system', `Failed to reject: ${e.message}`);
+    }
+    actionDiv.style.opacity = '0.5';
+    approveBtn.remove();
+    rejectBtn.remove();
+    actionDiv.append(el('span', {class: 'rec-tag status-rejected'}, 'rejected'));
+    fetchApprovals();
+  };
+
+  const buttons = el('div', {style:'margin-top:8px;'});
+  buttons.append(approveBtn, rejectBtn);
+  actionDiv.append(buttons);
   container.append(actionDiv);
   container.scrollTop = container.scrollHeight;
 }
 
+// Show execution output in chat and ask the model for a short interpretation.
+async function reportExecution(res) {
+  const cleanOutput = (res.stdout || '').trim();
+  const stderrOutput = (res.stderr || '').trim();
+  const fullOutput = stderrOutput ? `${cleanOutput}\n\nError output:\n${stderrOutput}`.trim() : cleanOutput;
+
+  renderChatMessage('system', `Executed \`${res.command}\` (exit ${res.returncode}):\n${fullOutput || '(no output)'}`);
+
+  const followupQuery = `[System: The command "${res.command}" was executed. Exit code: ${res.returncode}. Output:\n${truncateForPrompt(fullOutput)}]\n\nPlease briefly summarize what this output means for the user.`;
+  try { await streamChatQuery(followupQuery); } catch (aiErr) { renderChatMessage('assistant', `Error processing result: ${aiErr.message}`); }
+}
+
 async function streamChatQuery(query) {
+  // Snapshot the history BEFORE adding the current query — the backend appends
+  // the query itself, so including it here would send it twice.
+  const history = getChatHistory();
   chatHistory.push({ role: 'user', content: query });
+  lastUserQuery = query;
+
   const modelEl = document.getElementById('model_select');
   const model = modelEl ? modelEl.value || null : null;
-  const payload = { query, include_logs: true, log_limit: 20, model, history: getChatHistory() };
+  const payload = { query, model, history };
 
   const res = await fetch('/chat/stream', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
   if (!res.ok) {
@@ -144,9 +193,12 @@ async function streamChatQuery(query) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  let finalPayload = null;
-  const thinkingLines = [];
-  const container = document.getElementById('chat_messages');
+  const ctx = {
+    finalPayload: null,
+    rawResponseText: '',
+    thinkingLines: [],
+    container: document.getElementById('chat_messages'),
+  };
 
   // Build assistant message with avatar + bubble
   const msgWrapper = el('div', {class: 'chat-msg assistant'});
@@ -165,16 +217,39 @@ async function streamChatQuery(query) {
   const responseEl = el('span', {});
   bubble.append(thinkingPanel, responseEl);
   msgWrapper.append(avatar, bubble);
-  container.append(msgWrapper);
-  container.scrollTop = container.scrollHeight;
+  ctx.container.append(msgWrapper);
+  ctx.container.scrollTop = ctx.container.scrollHeight;
 
-  let rawResponseText = '';
+  ctx.responseEl = responseEl;
+  ctx.thinkingBody = thinkingBody;
+
+  function handleStreamEvent(event) {
+    if (event.type === 'chunk' && typeof event.text === 'string') {
+      ctx.rawResponseText += event.text;
+      ctx.responseEl.innerHTML = parseMarkdown(ctx.rawResponseText);
+    } else if (event.type === 'tool_call_result') {
+      const result = event.result || event.error || '';
+      if (result) {
+        ctx.thinkingLines.push(`[Tool result] ${result.substring(0, 300)}`);
+        ctx.thinkingBody.innerHTML = parseMarkdown(ctx.thinkingLines.join('\n\n'));
+      }
+    } else if (event.type === 'tool_call') {
+      const args = event.args || {};
+      ctx.thinkingLines.push(`[Tool call] ${event.tool || 'tool'}: ${JSON.stringify(args).substring(0, 200)}`);
+      ctx.thinkingBody.textContent = ctx.thinkingLines.join('\n\n');
+    } else if (event.type === 'suggested_action' && event.action) {
+      handleSuggestedAction(event.action, ctx.container);
+    } else if (event.type === 'final' && event.payload) {
+      ctx.finalPayload = event.payload;
+    } else if (event.type === 'error' && event.error) {
+      throw new Error(event.error);
+    }
+  }
 
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
-    const chunk = decoder.decode(value, { stream: true });
-    buffer += chunk;
+    buffer += decoder.decode(value, { stream: true });
 
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
@@ -183,70 +258,28 @@ async function streamChatQuery(query) {
       if (!trimmed) continue;
       let event;
       try { event = JSON.parse(trimmed); } catch (e) { continue; }
-
-      if (event.type === 'chunk' && typeof event.text === 'string') {
-        rawResponseText += event.text;
-        responseEl.innerHTML = parseMarkdown(rawResponseText);
-      } else if (event.type === 'tool_call_result') {
-        const result = event.result || event.error || '';
-        if (result) {
-          thinkingLines.push(`[Tool result] ${result.substring(0, 300)}`);
-          thinkingBody.innerHTML = parseMarkdown(thinkingLines.join('\n\n'));
-          // Tool results are now only shown inside the thinking panel
-        }
-      } else if (event.type === 'tool_call') {
-        const args = event.args || {};
-        thinkingLines.push(`[Tool call] ${event.tool || 'execute'}: ${JSON.stringify(args).substring(0, 200)}`);
-        thinkingBody.textContent = thinkingLines.join('\n\n');
-        handleToolCallEvent(event, container);
-      } else if (event.type === 'final' && event.payload) {
-        finalPayload = event.payload;
-      } else if (event.type === 'error' && event.error) {
-        throw new Error(event.error);
-      }
+      handleStreamEvent(event);
     }
   }
 
   if (buffer.trim()) {
     try {
-      const event = JSON.parse(buffer.trim());
-      if (event.type === 'chunk' && typeof event.text === 'string') {
-        rawResponseText += event.text;
-        responseEl.innerHTML = parseMarkdown(rawResponseText);
-      } else if (event.type === 'tool_call_result') {
-        const result = event.result || event.error || '';
-        if (result) {
-          thinkingLines.push(`[Tool result] ${result.substring(0, 300)}`);
-          thinkingBody.innerHTML = parseMarkdown(thinkingLines.join('\n\n'));
-          // Tool results are now only shown inside the thinking panel
-        }
-      } else if (event.type === 'tool_call') {
-        const args = event.args || {};
-        thinkingLines.push(`[Tool call] ${event.tool || 'execute'}: ${JSON.stringify(args).substring(0, 200)}`);
-        thinkingBody.textContent = thinkingLines.join('\n\n');
-        handleToolCallEvent(event, container);
-      } else if (event.type === 'final' && event.payload) {
-        finalPayload = event.payload;
-      } else if (event.type === 'error' && event.error) {
-        throw new Error(event.error);
-      }
+      handleStreamEvent(JSON.parse(buffer.trim()));
     } catch (e) { /* ignore trailing noise */ }
   }
 
-  const reasoning = finalPayload?.reasoning || '';
+  const finalPayload = ctx.finalPayload || { summary: ctx.rawResponseText, reasoning: '', confidence: 0.0, suggested_actions: [] };
+  const reasoning = finalPayload.reasoning || '';
   if (reasoning) {
-    thinkingLines.push(`[Reasoning] ${reasoning}`);
-    thinkingBody.textContent = thinkingLines.join('\n\n');
+    ctx.thinkingLines.push(`[Reasoning] ${reasoning}`);
+    thinkingBody.textContent = ctx.thinkingLines.join('\n\n');
   }
-  if (reasoning || thinkingLines.length > 0) {
+  if (reasoning || ctx.thinkingLines.length > 0) {
     thinkingSummary.textContent = reasoning
       ? `💭 ${reasoning.substring(0, 80)}${reasoning.length > 80 ? '…' : ''} (click to expand)`
       : `💭 Thought for a moment (click to expand)`;
   } else {
     thinkingPanel.remove();
-  }
-  if (!finalPayload) {
-    finalPayload = { summary: rawResponseText, reasoning: '', confidence: 0.0, suggested_actions: [] };
   }
 
   if (finalPayload.summary) {
@@ -254,7 +287,7 @@ async function streamChatQuery(query) {
     chatHistory.push({ role: 'assistant', content: finalPayload.summary });
   }
 
-  container.scrollTop = container.scrollHeight;
+  ctx.container.scrollTop = ctx.container.scrollHeight;
   return finalPayload;
 }
 
@@ -301,18 +334,40 @@ function renderChatMessage(role, text) {
   container.scrollTop = container.scrollHeight;
 }
 
-function renderRecCard(item) {
-  const elId = `rec_${item.id}`;
-  if (document.getElementById(elId)) return;
+// ═══════════════════════════════════════════════════════════════════════════
+// Recommendations (approval workflow)
+// ═══════════════════════════════════════════════════════════════════════════
 
-  const container = document.getElementById('recs_list');
-  if (!container) return;
+// Execution results by approval id so output survives list re-renders.
+const _executionResults = {};
 
-  const empty = container.querySelector('.empty-state');
-  if (empty) empty.remove();
+function rememberExecution(approvalId, res) {
+  _executionResults[approvalId] = res;
+}
 
-  const statusCls = item.status === 'pending' ? 'rec-pending' : item.status === 'approved' ? 'rec-approved' : item.status === 'rejected' ? 'rec-rejected' : 'rec-executed';
-  const card = el('div', {class: `rec-card ${statusCls}`, id: elId});
+function updateRecBadge(items) {
+  const pending = (items || []).filter(item => item.status === 'pending').length;
+  const badge = document.getElementById('rec_badge');
+  if (badge) {
+    badge.textContent = pending;
+    badge.style.display = pending > 0 ? 'flex' : 'none';
+  }
+}
+
+function recsEmptyState() {
+  return el('div', {class: 'empty-state'},
+    el('div', {class: 'empty-icon'}, '⚡'),
+    el('div', {}, 'No recommendations yet'),
+    el('div', {style:'font-size:12px'}, 'Ask the assistant about your homelab to get started'),
+  );
+}
+
+function buildRecCard(item) {
+  const statusCls = item.status === 'pending' ? 'rec-pending'
+    : item.status === 'approved' ? 'rec-approved'
+    : item.status === 'rejected' ? 'rec-rejected'
+    : 'rec-executed';
+  const card = el('div', {class: `rec-card ${statusCls}`, id: `rec_${item.id}`});
 
   card.append(el('div', {class: 'rec-action'}, item.action || 'Recommendation'));
 
@@ -327,6 +382,15 @@ function renderRecCard(item) {
 
   if (item.source_query) card.append(el('div', {class: 'rec-source'}, `Source: ${item.source_query}`));
   if (item.command) card.append(el('div', {class: 'rec-command'}, item.command));
+  if (item.review_note) card.append(el('div', {class: 'rec-source'}, item.review_note));
+
+  const execResult = _executionResults[item.id];
+  if (item.status === 'executed' && execResult) {
+    card.append(el('div', {class: 'rec-output'}, (execResult.stdout || '').trim() || '(no output)'));
+    if (execResult.stderr) {
+      card.append(el('div', {class: 'rec-output rec-output-err'}, execResult.stderr));
+    }
+  }
 
   const actions = el('div', {class: 'rec-buttons'});
   if (item.status === 'pending') {
@@ -347,123 +411,58 @@ function renderRecCard(item) {
     actions.append(execBtn);
   }
   card.append(actions);
-  container.appendChild(card);
-  updateRecBadge();
+  return card;
 }
 
-function updateRecCard(item) {
-  const elId = `rec_${item.id}`;
-  const existing = document.getElementById(elId);
-  if (!existing) { renderRecCard(item); return; }
-
-  existing.innerHTML = '';
-  const statusCls = item.status === 'pending' ? 'rec-pending' : item.status === 'approved' ? 'rec-approved' : item.status === 'rejected' ? 'rec-rejected' : 'rec-executed';
-  existing.className = `rec-card ${statusCls}`;
-
-  existing.append(el('div', {class: 'rec-action'}, item.action || 'Recommendation'));
-
-  const meta = el('div', {class: 'rec-meta'});
-  meta.append(el('span', {class: `rec-tag status-${item.status}`}, item.status));
-  if (item.risk) {
-    const riskLevel = item.risk === 'low' ? 'low' : item.risk === 'high' ? 'high' : 'medium';
-    meta.append(el('span', {class: `rec-tag risk-${riskLevel}`}, `risk: ${item.risk}`));
-  }
-  if (item.requested_by) meta.append(el('span', {class: 'rec-tag', style:'background:rgba(255,255,255,0.04);color:var(--text-muted);'}, `by: ${item.requested_by}`));
-  existing.append(meta);
-
-  if (item.source_query) existing.append(el('div', {class: 'rec-source'}, `Source: ${item.source_query}`));
-  if (item.command) existing.append(el('div', {class: 'rec-command'}, item.command));
-
-  const actions = el('div', {class: 'rec-buttons'});
-  if (item.status === 'pending') {
-    const approveBtn = el('button', {class: 'btn btn-success btn-sm'}, '✓ Approve');
-    approveBtn.onclick = () => decide(item.id, 'approved');
-    const rejectBtn = el('button', {class: 'btn btn-danger btn-sm'}, '✕ Reject');
-    rejectBtn.onclick = () => decide(item.id, 'rejected');
-    actions.append(approveBtn, rejectBtn);
-  }
-  if (item.status === 'approved' && item.command) {
-    const execBtn = el('button', {class: 'btn btn-primary btn-sm'}, '▶ Execute');
-    if (hasUnresolvedPlaceholder(item.command)) {
-      execBtn.disabled = true;
-      actions.append(el('span', {style:'color:var(--accent-danger);font-size:12px;display:flex;align-items:center;'}, 'Contains placeholder'));
-    } else {
-      execBtn.onclick = () => executeInline(item.id);
-    }
-    actions.append(execBtn);
-  }
-  existing.append(actions);
-  updateRecBadge();
-}
-
-async function createApprovalFromAction(action, source_query, autoApprove = false) {
-  const payload = {
-    action: action.action || 'action',
-    command: action.command || null,
-    target: action.target || null,
-    risk: action.risk || 'medium',
-    source_query: source_query,
-    requested_by: 'web-ui',
-  }
+async function fetchApprovals() {
+  const container = document.getElementById('recs_list');
+  if (!container) return;
+  let items;
   try {
-    const created = await api('/approvals', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
-    await fetchApprovals();
-    renderRecCard(created);
-    if (autoApprove) {
-      try {
-        const updated = await api(`/approvals/${created.id}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify({decision: 'approved', reviewer: 'web-ui', note: 'approved via chat'})});
-        await fetchApprovals();
-        updateRecCard(updated);
-      } catch (e) {
-        renderChatMessage('System', `Failed to auto-approve: ${e.message}`);
-      }
-    }
-  } catch (e) { renderChatMessage('System', `Failed to create approval: ${e.message}`); }
+    items = await api('/approvals');
+  } catch (e) {
+    console.warn('Failed to load approvals', e);
+    return;
+  }
+  container.innerHTML = '';
+  if (!Array.isArray(items) || items.length === 0) {
+    container.append(recsEmptyState());
+  } else {
+    items.forEach(item => container.append(buildRecCard(item)));
+  }
+  updateRecBadge(items);
 }
 
 async function decide(id, decision) {
   try {
-    const updated = await api(`/approvals/${id}`, {method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({decision, reviewer: 'web-ui', note: ''})});
-    await fetchApprovals();
-    updateRecCard(updated);
-  } catch (e) { alert(e.message); }
+    await api(`/approvals/${id}`, {method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({decision, reviewer: 'web-ui', note: ''})});
+  } catch (e) {
+    renderChatMessage('system', `Failed to update approval: ${e.message}`);
+  }
+  fetchApprovals();
 }
 
 async function executeInline(id) {
   try {
     const res = await api('/execute', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({approval_id: id})});
-    const card = document.getElementById(`rec_${id}`);
-    const cleanOutput = (res.stdout || '').trim();
-
-    if (card) {
-      card.innerHTML = '';
-      card.className = 'rec-card rec-executed';
-      card.append(el('div', {class: 'rec-action'}, `✓ Executed: ${res.command}`));
-
-      const meta = el('div', {class: 'rec-meta'});
-      meta.append(el('span', {class: 'rec-tag status-executed'}, 'executed'));
-      meta.append(el('span', {class: 'rec-tag', style:'background:rgba(255,255,255,0.04);color:var(--text-muted);'}, `${res.target || 'host'} · exit ${res.returncode ?? 'N/A'}`));
-      card.append(meta);
-
-      card.append(el('div', {class: 'rec-output'}, cleanOutput || '(no output)'));
-      if (res.stderr) {
-        card.append(el('div', {class: 'rec-output rec-output-err'}, res.stderr));
-      }
-    }
-
-    const stderrOutput = (res.stderr || '').trim();
-    const fullOutput = stderrOutput ? `${cleanOutput}\n\nError output:\n${stderrOutput}`.trim() : cleanOutput;
-
-    renderChatMessage('system', `Executed \`${res.command}\` on ${res.target || 'host'} (exit ${res.returncode}):\n${fullOutput}`);
-
-    const followupQuery = `[System: The command "${res.command}" was executed on "${res.target || 'host'}". Exit code: ${res.returncode}. Output:\n${fullOutput}]\n\nPlease briefly summarize what this output means for the user.`;
-    try { await streamChatQuery(followupQuery); } catch (aiErr) { renderChatMessage('assistant', `Error processing result: ${aiErr.message}`); }
-    updateRecBadge();
+    rememberExecution(id, res);
+    await fetchApprovals();
+    await reportExecution(res);
   } catch (e) {
     renderChatMessage('system', `Execution failed: ${e.message}`);
     const followupQuery = `[System: An approved command failed to execute. Error: ${e.message}]\n\nPlease explain why this failed and suggest a fix if possible.`;
     try { await streamChatQuery(followupQuery); } catch (_) {}
+    fetchApprovals();
   }
+}
+
+async function clearFinishedApprovals() {
+  try {
+    await api('/approvals/cleanup?remove_empty=true&finished=true', {method: 'POST'});
+  } catch (e) {
+    renderChatMessage('system', `Failed to clear recommendations: ${e.message}`);
+  }
+  fetchApprovals();
 }
 
 // ===========================================================================
@@ -474,8 +473,9 @@ const SETTING_FIELDS = [
   'app_env', 'app_host', 'app_port',
   'proxmox_url', 'proxmox_host_ip', 'proxmox_port', 'proxmox_realm',
   'proxmox_user', 'proxmox_token_id', 'proxmox_token_secret', 'proxmox_verify_ssl',
-  'ollama_url', 'ollama_model',
+  'ollama_url', 'ollama_model', 'ollama_embed_model', 'ollama_num_ctx',
   'qdrant_url', 'qdrant_api_key', 'qdrant_current_collection_name', 'qdrant_history_collection_name',
+  'qdrant_logs_collection_name',
   'loki_url', 'prometheus_url',
   'approval_db_path',
 ];
@@ -577,6 +577,9 @@ function switchView(viewId) {
   if (viewId === 'view_logs') {
     populateLogsContainerFilter();
     fetchLogs();
+  }
+  if (viewId === 'view_recommendations') {
+    fetchApprovals();
   }
 }
 
@@ -808,17 +811,13 @@ document.addEventListener('DOMContentLoaded', () => {
     chatClear.addEventListener('click', () => {
       document.getElementById('chat_messages').innerHTML = '';
       chatHistory.length = 0;
+      _renderedActionKeys.clear();
     });
   }
 
-  // Recommendations clear
+  // Recommendations: clear finished (executed/rejected) approvals
   const recsClear = document.getElementById('recs_clear');
-  if (recsClear) {
-    recsClear.addEventListener('click', () => {
-      document.getElementById('recs_list').innerHTML = '<div class="empty-state"><div class="empty-icon"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div><div>No recommendations yet</div><div style="font-size:12px">Ask the assistant about your homelab to get started</div></div>';
-      updateRecBadge();
-    });
-  }
+  if (recsClear) recsClear.addEventListener('click', clearFinishedApprovals);
 
   // Navigation
   document.querySelectorAll('.nav-btn').forEach(btn => {
@@ -864,4 +863,5 @@ document.addEventListener('DOMContentLoaded', () => {
   // Initial loads
   fetchModels();
   loadSettings();
+  fetchApprovals();
 });
