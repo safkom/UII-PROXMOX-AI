@@ -44,6 +44,15 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 }
 
+function parseMarkdown(text) {
+  let html = escapeHtml(text || '');
+  html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*(.*?)\*/g, '<em>$1</em>');
+  html = html.replace(/`(.*?)`/g, '<code>$1</code>');
+  html = html.replace(/\n/g, '<br>');
+  return html;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Recommendations Badge
 // ═══════════════════════════════════════════════════════════════════════════
@@ -103,11 +112,16 @@ function handleToolCallEvent(event, container) {
     try {
       const res = await api('/execute/direct', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({command: cmd, risk})});
       const cleanOutput = (res.stdout || '').trim();
-      renderChatMessage('system', `Executed \`${cmd}\` (exit ${res.returncode}):\n${cleanOutput || '(no output)'}`);
-      const followupQuery = `[System: The command "${cmd}" was executed. Exit code: ${res.returncode}. Output:\n${cleanOutput}]\n\nPlease briefly summarize what this output means for the user.`;
+      const stderrOutput = (res.stderr || '').trim();
+      const fullOutput = stderrOutput ? `${cleanOutput}\n\nError output:\n${stderrOutput}`.trim() : cleanOutput;
+      
+      renderChatMessage('system', `Executed \`${cmd}\` (exit ${res.returncode}):\n${fullOutput || '(no output)'}`);
+      const followupQuery = `[System: The command "${cmd}" was executed. Exit code: ${res.returncode}. Output:\n${fullOutput}]\n\nPlease briefly summarize what this output means for the user.`;
       try { await streamChatQuery(followupQuery); } catch (_) {}
     } catch (e) {
       renderChatMessage('system', `Execution failed: ${e.message}`);
+      const followupQuery = `[System: The command "${cmd}" failed to execute. Error: ${e.message}]\n\nPlease explain why this failed and suggest a fix if possible.`;
+      try { await streamChatQuery(followupQuery); } catch (_) {}
     }
   };
   actionDiv.append(execBtn);
@@ -142,7 +156,10 @@ async function streamChatQuery(query) {
   // Thinking panel
   const thinkingPanel = el('div', {class: 'thinking-panel'});
   const thinkingSummary = el('div', {class: 'thinking-summary'}, 'Thinking…');
-  const thinkingBody = el('div', {class: 'thinking-body'});
+  const thinkingBody = el('div', {class: 'thinking-body', style: 'display: none;'});
+  thinkingSummary.onclick = () => {
+    thinkingBody.style.display = thinkingBody.style.display === 'none' ? 'block' : 'none';
+  };
   thinkingPanel.append(thinkingSummary, thinkingBody);
 
   const responseEl = el('span', {});
@@ -150,6 +167,8 @@ async function streamChatQuery(query) {
   msgWrapper.append(avatar, bubble);
   container.append(msgWrapper);
   container.scrollTop = container.scrollHeight;
+
+  let rawResponseText = '';
 
   while (true) {
     const { value, done } = await reader.read();
@@ -166,14 +185,14 @@ async function streamChatQuery(query) {
       try { event = JSON.parse(trimmed); } catch (e) { continue; }
 
       if (event.type === 'chunk' && typeof event.text === 'string') {
-        responseEl.textContent += event.text;
+        rawResponseText += event.text;
+        responseEl.innerHTML = parseMarkdown(rawResponseText);
       } else if (event.type === 'tool_call_result') {
         const result = event.result || event.error || '';
         if (result) {
           thinkingLines.push(`[Tool result] ${result.substring(0, 300)}`);
-          thinkingBody.textContent = thinkingLines.join('\n\n');
-          container.append(el('div', {class: 'tool-result'}, result));
-          container.scrollTop = container.scrollHeight;
+          thinkingBody.innerHTML = parseMarkdown(thinkingLines.join('\n\n'));
+          // Tool results are now only shown inside the thinking panel
         }
       } else if (event.type === 'tool_call') {
         const args = event.args || {};
@@ -192,13 +211,14 @@ async function streamChatQuery(query) {
     try {
       const event = JSON.parse(buffer.trim());
       if (event.type === 'chunk' && typeof event.text === 'string') {
-        responseEl.textContent += event.text;
+        rawResponseText += event.text;
+        responseEl.innerHTML = parseMarkdown(rawResponseText);
       } else if (event.type === 'tool_call_result') {
         const result = event.result || event.error || '';
         if (result) {
           thinkingLines.push(`[Tool result] ${result.substring(0, 300)}`);
-          thinkingBody.textContent = thinkingLines.join('\n\n');
-          container.append(el('div', {class: 'tool-result'}, result));
+          thinkingBody.innerHTML = parseMarkdown(thinkingLines.join('\n\n'));
+          // Tool results are now only shown inside the thinking panel
         }
       } else if (event.type === 'tool_call') {
         const args = event.args || {};
@@ -223,11 +243,11 @@ async function streamChatQuery(query) {
     : (thinkingLines.length > 0 ? `💭 Thought for a moment (click to expand)` : '');
 
   if (!finalPayload) {
-    finalPayload = { summary: responseEl.textContent, reasoning: '', confidence: 0.0, suggested_actions: [] };
+    finalPayload = { summary: rawResponseText, reasoning: '', confidence: 0.0, suggested_actions: [] };
   }
 
   if (finalPayload.summary) {
-    responseEl.textContent = finalPayload.summary;
+    responseEl.innerHTML = parseMarkdown(finalPayload.summary);
     chatHistory.push({ role: 'assistant', content: finalPayload.summary });
   }
 
@@ -270,7 +290,7 @@ function renderChatMessage(role, text) {
       }
     });
   } else {
-    bubble.textContent = text;
+    bubble.innerHTML = parseMarkdown(text);
   }
 
   msgWrapper.append(avatar, bubble);
@@ -428,13 +448,18 @@ async function executeInline(id) {
       }
     }
 
-    renderChatMessage('system', `Executed \`${res.command}\` on ${res.target || 'host'} (exit ${res.returncode}):\n${cleanOutput}`);
+    const stderrOutput = (res.stderr || '').trim();
+    const fullOutput = stderrOutput ? `${cleanOutput}\n\nError output:\n${stderrOutput}`.trim() : cleanOutput;
 
-    const followupQuery = `[System: The command "${res.command}" was executed on "${res.target || 'host'}". Exit code: ${res.returncode}. Output:\n${cleanOutput}]\n\nPlease briefly summarize what this output means for the user.`;
+    renderChatMessage('system', `Executed \`${res.command}\` on ${res.target || 'host'} (exit ${res.returncode}):\n${fullOutput}`);
+
+    const followupQuery = `[System: The command "${res.command}" was executed on "${res.target || 'host'}". Exit code: ${res.returncode}. Output:\n${fullOutput}]\n\nPlease briefly summarize what this output means for the user.`;
     try { await streamChatQuery(followupQuery); } catch (aiErr) { renderChatMessage('assistant', `Error processing result: ${aiErr.message}`); }
     updateRecBadge();
   } catch (e) {
     renderChatMessage('system', `Execution failed: ${e.message}`);
+    const followupQuery = `[System: An approved command failed to execute. Error: ${e.message}]\n\nPlease explain why this failed and suggest a fix if possible.`;
+    try { await streamChatQuery(followupQuery); } catch (_) {}
   }
 }
 
@@ -747,6 +772,8 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!q) return;
       renderChatMessage('user', q);
       input.value = '';
+      input.disabled = true;
+      send.disabled = true;
       try {
         await streamChatQuery(q);
       } catch (e) {
@@ -754,6 +781,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const lastMsg = container.lastElementChild;
         if (lastMsg) lastMsg.remove();
         renderChatMessage('assistant', 'Error: ' + e.message);
+      } finally {
+        input.disabled = false;
+        send.disabled = false;
+        input.focus();
       }
     };
   }

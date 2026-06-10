@@ -369,12 +369,15 @@ def chat_stream(payload: ChatRequest):
         "ALWAYS use the relevant tool first when the user asks about containers, VMs, logs, or infrastructure. "
         "For example, if the user asks about running containers, call scan_containers. "
         "After you have the tool results, provide a clear and helpful answer. "
-        "When you have all the context you need (after tool results), respond with ONLY a JSON object: "
-        '{"summary": "your answer to the user", "reasoning": "brief reasoning", "confidence": 0.0-1.0, '
+        "When you have all the context you need (after tool results), provide your final answer to the user in PLAIN TEXT. "
+        "Then, on a new line, output the following delimiter exactly: ###METADATA###\n"
+        "Then, output ONLY a JSON object with this structure: "
+        '{"reasoning": "brief reasoning", "confidence": 0.0-1.0, '
         '"suggested_actions": [{"action": "action description", "command": "executable shell command or null", "target": "container name or null", "risk": "low|medium|high"}]}. '
         "CRITICAL: The command field must contain a REAL Proxmox/Linux shell command that can be executed on the host. "
-        "Valid commands include: pct list, pct config <vmid>, qm list, qm config <vmid>, pvesh /nodes/<node>/status, "
+        "Valid commands include: pct list, pct config <vmid>, pct start <vmid>, qm list, qm config <vmid>, qm start <vmid>, pvesh /nodes/<node>/status, "
         "journalctl -u <service>, systemctl status <service>, ip addr, df -h, free -m, ps aux. "
+        "IMPORTANT: When executing Proxmox commands like pct or qm, you MUST use the numeric `vmid` (e.g. 101, 102), NOT the human-readable name! "
         "NEVER put tool names like 'scan_containers' or 'get_logs' in the command field. "
         "If you cannot provide a real shell command, set command to null."
     )
@@ -386,39 +389,105 @@ def chat_stream(payload: ChatRequest):
     messages.append({"role": "user", "content": payload.query})
 
     def generator():
+        import re
         try:
             ollama_client = OllamaClient(settings)
             if payload.model:
                 ollama_client.model = payload.model
 
-            # Show thinking indicator while the model processes
-            yield json.dumps({"type": "chunk", "text": "Thinking..."}) + "\n"
+            # The frontend UI natively handles showing a "Thinking..." indicator
+            # No need to send it as a text chunk here.
 
-            # Use client.chat() which handles the full tool-calling loop
-            # internally: call LLM -> check tool_calls -> execute -> repeat
-            model_result = ollama_client.chat(messages, get_tool_definitions())
+            buffer = ""
+            metadata_started = False
 
-            # Stream the final answer summary character by character
-            summary = model_result.get("summary", "")
-            if summary:
-                for char in summary:
-                    yield json.dumps({"type": "chunk", "text": char}) + "\n"
+            for event in ollama_client.chat_stream_events(messages, get_tool_definitions()):
+                if event["type"] == "content_chunk":
+                    chunk = event["text"]
+                    if not metadata_started:
+                        buffer += chunk
+                        idx = buffer.find("###METADATA###")
+                        if idx != -1:
+                            metadata_started = True
+                            valid_text = buffer[:idx]
+                            if valid_text:
+                                yield json.dumps({"type": "chunk", "text": valid_text}) + "\n"
+                            buffer = buffer[idx + len("###METADATA###"):]
+                        else:
+                            # Safely yield if not containing partial ###METADATA###
+                            if len(buffer) > 14:
+                                valid_text = buffer[:-14]
+                                yield json.dumps({"type": "chunk", "text": valid_text}) + "\n"
+                                buffer = buffer[-14:]
+                    else:
+                        buffer += chunk
 
-            # Emit any suggested_actions as tool_call events for the UI
-            for action in model_result.get("suggested_actions", []):
-                if isinstance(action, dict) and action.get("command"):
+                elif event["type"] == "tool_call":
                     yield json.dumps({
                         "type": "tool_call",
-                        "tool": "execute",
-                        "args": {
-                            "action": action.get("action", "command"),
-                            "command": action.get("command", ""),
-                            "target": action.get("target"),
-                            "risk": action.get("risk", "medium"),
-                        },
+                        "tool": event.get("name", "unknown"),
+                        "args": event.get("args", {}),
+                    }) + "\n"
+                
+                elif event["type"] == "tool_result":
+                    yield json.dumps({
+                        "type": "tool_call_result",
+                        "result": event.get("result", ""),
                     }) + "\n"
 
-            yield json.dumps({"type": "final", "payload": model_result}) + "\n"
+                elif event["type"] == "final_answer":
+                    # Yield any remaining text if metadata hasn't started
+                    if not metadata_started and buffer:
+                        yield json.dumps({"type": "chunk", "text": buffer}) + "\n"
+                        buffer = ""
+                    
+                    # Try parsing the metadata if any
+                    metadata = {}
+                    if buffer.strip():
+                        try:
+                            cleaned = buffer.strip()
+                            fence_match = re.search(r"```(?:json)?\s*\n?(.+?)\n?```", cleaned, re.DOTALL)
+                            if fence_match:
+                                cleaned = fence_match.group(1).strip()
+                            metadata = json.loads(cleaned)
+                        except Exception:
+                            pass
+
+                    # Extract suggested actions safely
+                    raw_actions = metadata.get("suggested_actions", [])
+                    normalized_actions = []
+                    if isinstance(raw_actions, list):
+                        for item in raw_actions:
+                            if not isinstance(item, dict): continue
+                            normalized_actions.append({
+                                "action": str(item.get("action", "Investigate issue")),
+                                "command": item.get("command"),
+                                "target": item.get("target"),
+                                "risk": str(item.get("risk", "medium")),
+                            })
+
+                    full_content = event.get("content", "")
+                    idx = full_content.find("###METADATA###")
+                    summary_text = full_content[:idx].strip() if idx != -1 else full_content.strip()
+
+                    payload_out = {
+                        "summary": summary_text,
+                        "reasoning": str(metadata.get("reasoning", "")),
+                        "confidence": float(metadata.get("confidence", 0.0) if isinstance(metadata.get("confidence"), (int, float)) else 0.0),
+                        "suggested_actions": normalized_actions,
+                    }
+                    
+                    # Also stream actions as tool_calls for frontend
+                    for action in normalized_actions:
+                        if action.get("command"):
+                            yield json.dumps({
+                                "type": "tool_call",
+                                "tool": "execute",
+                                "args": action,
+                            }) + "\n"
+                    
+                    yield json.dumps({"type": "final", "payload": payload_out}) + "\n"
+
         except Exception as exc:
             logger.error(f"Streaming failed: {exc}")
             yield json.dumps({"type": "error", "error": str(exc)}) + "\n"

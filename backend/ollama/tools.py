@@ -51,34 +51,3 @@ def search_logs(query: str, container: str = "", limit: int = 10) -> dict:
     }
 
 
-@register_tool("start_container")
-def start_container(container: str) -> dict:
-    """Start a stopped container or VM by name. Requires approval before execution."""
-    return {
-        "status": "pending_approval",
-        "message": f"Start request for '{container}' submitted for approval.",
-        "container": container,
-        "action": "start",
-    }
-
-
-@register_tool("stop_container")
-def stop_container(container: str) -> dict:
-    """Stop a running container or VM by name. Requires approval before execution."""
-    return {
-        "status": "pending_approval",
-        "message": f"Stop request for '{container}' submitted for approval.",
-        "container": container,
-        "action": "stop",
-    }
-
-
-@register_tool("restart_container")
-def restart_container(container: str) -> dict:
-    """Restart a running container or VM by name. Requires approval before execution."""
-    return {
-        "status": "pending_approval",
-        "message": f"Restart request for '{container}' submitted for approval.",
-        "container": container,
-        "action": "restart",
-    }

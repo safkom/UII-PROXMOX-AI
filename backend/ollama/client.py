@@ -168,6 +168,108 @@ class OllamaClient:
         content = history[-1].get("content", "") if history else ""
         return self._parse_content(content)
 
+    def chat_stream_events(self, messages: list[dict], tools: list[dict] | None = None):
+        """Send messages to the LLM with tools, yield events as they happen, handle tool loop."""
+        history = list(messages)
+        max_rounds = 5
+
+        for round_num in range(max_rounds):
+            resp = self._chat(history, tools=tools, stream=True)
+            if not isinstance(resp, requests.Response):
+                raise RuntimeError("Unexpected response type from Ollama stream")
+
+            content = ""
+            tool_calls_dict = {}
+            msg_role = "assistant"
+            
+            for raw in resp.iter_lines(decode_unicode=False):
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="replace")
+                if not line.strip():
+                    continue
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        continue
+                    try:
+                        data = json.loads(data_str)
+                        delta = data.get("choices", [{}])[0].get("delta", {})
+                        
+                        if "role" in delta:
+                            msg_role = delta["role"]
+                        
+                        if "tool_calls" in delta:
+                            for tc in delta["tool_calls"]:
+                                idx = tc.get("index")
+                                if idx not in tool_calls_dict:
+                                    tool_calls_dict[idx] = {"id": tc.get("id", ""), "type": "function", "function": {"name": "", "arguments": ""}}
+                                if "id" in tc and tc["id"]:
+                                    tool_calls_dict[idx]["id"] = tc["id"]
+                                if "function" in tc:
+                                    if "name" in tc["function"] and tc["function"]["name"]:
+                                        tool_calls_dict[idx]["function"]["name"] += tc["function"]["name"]
+                                    if "arguments" in tc["function"] and tc["function"]["arguments"]:
+                                        tool_calls_dict[idx]["function"]["arguments"] += tc["function"]["arguments"]
+
+                        if "content" in delta and delta["content"]:
+                            chunk = delta["content"]
+                            content += chunk
+                            yield {"type": "content_chunk", "text": chunk}
+                    except json.JSONDecodeError:
+                        pass
+                else:
+                    try:
+                        data = json.loads(line)
+                        if "message" in data:
+                            chunk = data["message"].get("content", "")
+                            if chunk:
+                                content += chunk
+                                yield {"type": "content_chunk", "text": chunk}
+                    except json.JSONDecodeError:
+                        pass
+
+            msg = {"role": msg_role, "content": content}
+            if tool_calls_dict:
+                msg["tool_calls"] = list(tool_calls_dict.values())
+                
+            history.append(msg)
+            
+            tool_calls = self._extract_openai_tool_calls(msg)
+            if not tool_calls:
+                tool_calls = self._parse_text_tool_calls(content)
+                
+            if not tool_calls:
+                yield {"type": "final_answer", "content": content}
+                return
+
+            for tc in tool_calls:
+                yield {"type": "tool_call", "name": tc.get("name"), "args": tc.get("args")}
+                
+            for tc in tool_calls:
+                tool_name = tc.get("name", "")
+                tool_args = tc.get("args", {})
+                if isinstance(tool_args, str):
+                    try:
+                        tool_args = json.loads(tool_args)
+                    except json.JSONDecodeError:
+                        tool_args = {}
+
+                result = run_tool(tool_name, tool_args)
+                tool_content = self._format_tool_result(tool_name, result)
+                
+                history.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "name": tool_name,
+                    "content": tool_content,
+                })
+                yield {"type": "tool_result", "name": tool_name, "result": tool_content}
+
+        content = history[-1].get("content", "") if history else ""
+        yield {"type": "final_answer", "content": content}
+
+
     @staticmethod
     def _extract_openai_tool_calls(msg: dict) -> list[dict]:
         """Extract tool calls from the OpenAI-format message field."""
@@ -350,8 +452,9 @@ class OllamaClient:
                 stopped = [c for c in containers if c.get("status") == "stopped"]
                 lines = [f"Container scan: {count} total ({len(running)} running, {len(stopped)} stopped)"]
                 for c in containers:
-                    ip_info = f", IP: {c['ip']}" if c.get("ip") else ""
-                    lines.append(f"  - {c['name']} ({c['type']}, {c['node']}, {c['status']}{ip_info})")
+                    ip_info = f", IP: {c.get('ip')}" if c.get("ip") else ""
+                    vmid = c.get('vmid', 'unknown')
+                    lines.append(f"  - {c.get('name', 'unknown')} (vmid: {vmid}, {c.get('type', 'unknown')}, {c.get('node', 'unknown')}, {c.get('status', 'unknown')}{ip_info})")
                 return "\n".join(lines)
             if tool_name == "get_logs":
                 logs = result.get("logs", [])
