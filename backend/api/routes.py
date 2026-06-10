@@ -50,36 +50,18 @@ router = APIRouter()
 approval_store = ApprovalStore()
 exec_service = ExecutionService()
 
-
-def build_container_brief(containers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": container.get("name"),
-            "type": container.get("type"),
-            "node": container.get("node"),
-            "status": container.get("status"),
-            "ip": container.get("ip"),
-        }
-        for container in containers
-    ]
+# Cap how much conversation history is replayed to the model. The history is
+# re-sent on every round of the tool loop, so this directly bounds prompt size
+# on small local models.
+MAX_HISTORY_MESSAGES = 10
 
 
-def fetch_container_scan_context(settings) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
-    client = ProxmoxClient(settings)
-    scan_data = client.scan_inventory()
-    containers = scan_data.get("containers", [])
-    return containers, build_container_brief(containers), scan_data
-
-
-def format_container_scan_context(scan_data: dict[str, Any], container_brief: list[dict[str, Any]]) -> str:
-    diagnostics = scan_data.get("diagnostics", [])
-    scanned_nodes = scan_data.get("scanned_nodes", 0)
-    context = [
-        f"Fresh container scan ({len(container_brief)} items across {scanned_nodes} nodes):\n{container_brief}",
-    ]
-    if diagnostics:
-        context.append(f"Scan diagnostics: {diagnostics}")
-    return "\n\n".join(context) + "\n\n"
+def build_chat_messages(system_prompt: str, payload: ChatRequest) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    for msg in payload.history[-MAX_HISTORY_MESSAGES:]:
+        messages.append({"role": msg.role, "content": msg.content})
+    messages.append({"role": "user", "content": payload.query})
+    return messages
 
 
 def collect_service_health() -> list[ServiceHealth]:
@@ -131,7 +113,6 @@ def list_containers():
     except Exception as exc:
         logger.error(f"Failed to fetch containers: {exc}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch containers from Proxmox: {exc}")
-    return []
 
 
 @router.get("/infrastructure/current", response_model=List[Container])
@@ -231,7 +212,8 @@ def debug_proxmox():
         client = ProxmoxClient(settings)
         base_url = client.base_url
         verify = client.session.verify
-        auth = client.session.headers.get("Authorization", "")[:60] + "..."
+        # Show only the token name, never any part of the secret.
+        auth = client.session.headers.get("Authorization", "").split("=")[0] + "=***"
         try:
             nodes = client.get_nodes()
             return {"ok": True, "base_url": base_url, "verify_ssl": verify, "auth_header": auth, "nodes": nodes}
@@ -277,26 +259,18 @@ def chat(payload: ChatRequest):
     settings = get_settings()
 
     system_prompt = (
-        "You are an on-prem Proxmox homelab DevOps assistant. "
-        "You have access to tools that can scan containers, fetch logs, search logs, and manage containers. "
-        "ALWAYS use the relevant tool first when the user asks about containers, VMs, logs, or infrastructure. "
-        "For example, if the user asks about running containers, call scan_containers. "
-        "After you have the tool results, provide a clear and helpful answer. "
-        "When you have all the context you need (after tool results), respond with ONLY a JSON object: "
+        "You are a Proxmox homelab DevOps assistant with tools to scan containers, fetch logs, and search logs. "
+        "ALWAYS call the relevant tool before answering questions about containers, VMs, logs, or infrastructure. "
+        "Once you have the tool results, respond with ONLY this JSON object: "
         '{"summary": "your answer to the user", "reasoning": "brief reasoning", "confidence": 0.0-1.0, '
-        '"suggested_actions": [{"action": "action description", "command": "executable shell command or null", "target": "container name or null", "risk": "low|medium|high"}]}. '
-        "CRITICAL: The command field must contain a REAL Proxmox/Linux shell command that can be executed on the host. "
-        "Valid commands include: pct list, pct config <vmid>, qm list, qm config <vmid>, pvesh /nodes/<node>/status, "
-        "journalctl -u <service>, systemctl status <service>, ip addr, df -h, free -m, ps aux. "
-        "NEVER put tool names like 'scan_containers' or 'get_logs' in the command field. "
-        "If you cannot provide a real shell command, set command to null."
+        '"suggested_actions": [{"action": "description", "command": "shell command or null", "target": "container name or null", "risk": "low|medium|high"}]}. '
+        "The command field must be a real shell command runnable on the Proxmox host "
+        "(e.g. pct list, pct config <vmid>, qm list, journalctl -u <service>, systemctl status <service>, df -h, free -m). "
+        "Use the numeric vmid with pct/qm, never the name. Never put tool names in the command field. "
+        "If no real command applies, set command to null."
     )
 
-    # Build messages array with system prompt, history, and current query
-    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-    for msg in payload.history:
-        messages.append({"role": msg.role, "content": msg.content})
-    messages.append({"role": "user", "content": payload.query})
+    messages = build_chat_messages(system_prompt, payload)
 
     try:
         ollama_client = OllamaClient(settings)
@@ -352,42 +326,22 @@ def chat(payload: ChatRequest):
 def chat_stream(payload: ChatRequest):
     settings = get_settings()
 
-    # Clean up old executed/rejected approvals so they don't reappear
-    try:
-        with approval_store._lock:
-            with approval_store._conn:
-                approval_store._conn.execute(
-                    "DELETE FROM approvals WHERE status NOT IN ('pending',)"
-                )
-                approval_store._conn.commit()
-    except Exception:
-        pass
-
     system_prompt = (
-        "You are an on-prem Proxmox homelab DevOps assistant. "
-        "You have access to tools that can scan containers, fetch logs, search logs, and manage containers. "
-        "ALWAYS use the relevant tool first when the user asks about containers, VMs, logs, or infrastructure. "
-        "For example, if the user asks about running containers, call scan_containers. "
-        "After you have the tool results, provide a clear and helpful answer. "
-        "When you have all the context you need (after tool results), provide your final answer to the user in PLAIN TEXT. "
-        "Then, on a new line, output the following delimiter exactly: ###METADATA###\n"
-        "Then, output ONLY a JSON object with this structure: "
+        "You are a Proxmox homelab DevOps assistant with tools to scan containers, fetch logs, and search logs. "
+        "ALWAYS call the relevant tool before answering questions about containers, VMs, logs, or infrastructure. "
+        "Once you have the tool results, answer the user in PLAIN TEXT. "
+        "Then, on a new line, output this delimiter exactly: ###METADATA###\n"
+        "Then output ONLY this JSON object: "
         '{"reasoning": "brief reasoning", "confidence": 0.0-1.0, '
-        '"suggested_actions": [{"action": "action description", "command": "executable shell command or null", "target": "container name or null", "risk": "low|medium|high"}]}. '
-        "CRITICAL: The command field must contain a REAL Proxmox/Linux shell command that can be executed on the host. "
-        "Valid commands include: pct list, pct config <vmid>, pct start <vmid>, qm list, qm config <vmid>, qm start <vmid>, pvesh /nodes/<node>/status, "
-        "journalctl -u <service>, systemctl status <service>, ip addr, df -h, free -m, ps aux. "
-        "IMPORTANT: When executing Proxmox commands like pct or qm, you MUST use the numeric `vmid` (e.g. 101, 102), NOT the human-readable name! "
-        "CRITICAL: You MUST ONLY output a MAXIMUM of ONE suggested action per response! Do NOT queue up multiple commands at once. If you need to perform multiple steps, propose the first command, wait for its output to be returned to you, and then propose the next command in your subsequent response. "
-        "NEVER put tool names like 'scan_containers' or 'get_logs' in the command field. "
-        "If you cannot provide a real shell command, set command to null."
+        '"suggested_actions": [{"action": "description", "command": "shell command or null", "target": "container name or null", "risk": "low|medium|high"}]}. '
+        "The command field must be a real shell command runnable on the Proxmox host "
+        "(e.g. pct list, pct config <vmid>, pct start <vmid>, qm list, journalctl -u <service>, systemctl status <service>, df -h, free -m). "
+        "Use the numeric vmid with pct/qm, never the name. Never put tool names in the command field. "
+        "Suggest at most ONE action per response; propose the next step only after seeing the result. "
+        "If no real command applies, set command to null."
     )
 
-    # Build messages array with system prompt, history, and current query
-    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-    for msg in payload.history:
-        messages.append({"role": msg.role, "content": msg.content})
-    messages.append({"role": "user", "content": payload.query})
+    messages = build_chat_messages(system_prompt, payload)
 
     def generator():
         import re
@@ -477,16 +431,16 @@ def chat_stream(payload: ChatRequest):
                         "confidence": float(metadata.get("confidence", 0.0) if isinstance(metadata.get("confidence"), (int, float)) else 0.0),
                         "suggested_actions": normalized_actions,
                     }
-                    
-                    # Also stream actions as tool_calls for frontend
+
+                    # Surface actionable suggestions so the UI can create
+                    # approval requests for them.
                     for action in normalized_actions:
                         if action.get("command"):
                             yield json.dumps({
-                                "type": "tool_call",
-                                "tool": "execute",
-                                "args": action,
+                                "type": "suggested_action",
+                                "action": action,
                             }) + "\n"
-                    
+
                     yield json.dumps({"type": "final", "payload": payload_out}) + "\n"
 
         except Exception as exc:
@@ -685,9 +639,9 @@ def create_approval(request: ApprovalCreateRequest):
 
 @router.get("/approvals", response_model=List[ApprovalItem])
 def list_approvals(status: str | None = None):
-    allowed = {"pending", "approved", "rejected"}
+    allowed = {"pending", "approved", "rejected", "executed"}
     if status and status not in allowed:
-        raise HTTPException(status_code=400, detail="status must be pending, approved, or rejected")
+        raise HTTPException(status_code=400, detail="status must be pending, approved, rejected, or executed")
 
     try:
         items = approval_store.list(status=status)
@@ -714,13 +668,8 @@ def get_approval(approval_id: str):
 @router.delete("/approvals/{approval_id}")
 def delete_approval(approval_id: str):
     try:
-        existing = approval_store.get(approval_id)
-        if not existing:
+        if not approval_store.delete(approval_id):
             raise HTTPException(status_code=404, detail="Approval not found")
-        # perform a hard delete from the database
-        with approval_store._lock:
-            with approval_store._conn:
-                approval_store._conn.execute("DELETE FROM approvals WHERE id = ?", (approval_id,))
         return {"deleted": approval_id}
     except HTTPException:
         raise
@@ -730,25 +679,16 @@ def delete_approval(approval_id: str):
 
 
 @router.post("/approvals/cleanup")
-def cleanup_approvals(remove_empty: bool = True, action: str | None = None):
-    """Remove approvals matching simple filters.
+def cleanup_approvals(remove_empty: bool = True, action: str | None = None, finished: bool = False):
+    """Remove approvals matching any of the given filters (OR semantics).
 
-    - `remove_empty`: if true, delete approvals where `command` is NULL or empty
-    - `action`: if provided, delete only approvals with this action value
+    - `remove_empty`: delete approvals where `command` is NULL or empty
+    - `action`: delete approvals with this action value
+    - `finished`: delete executed and rejected approvals
     """
     try:
-        with approval_store._lock:
-            conn = approval_store._conn
-            query = "DELETE FROM approvals WHERE 1=1"
-            params: list = []
-            if remove_empty:
-                query += " AND (command IS NULL OR trim(command) = '')"
-            if action:
-                query += " AND action = ?"
-                params.append(action)
-            cur = conn.execute(query, params)
-            deleted = cur.rowcount if cur is not None else 0
-            conn.commit()
+        statuses = ["executed", "rejected"] if finished else None
+        deleted = approval_store.cleanup(remove_empty=remove_empty, action=action, statuses=statuses)
         return {"deleted": deleted}
     except Exception as exc:
         logger.error(f"Failed to cleanup approvals: {exc}")
@@ -783,9 +723,10 @@ def decide_approval(approval_id: str, request: ApprovalDecisionRequest):
 
 @router.post("/execute", response_model=ExecutionResult)
 def execute_command(request: ExecuteRequest):
-    """Execute an approved, validated diagnostic command through ProxVNC.
+    """Execute an approved, validated diagnostic command over SSH.
 
     Only executions tied to an approval (status == 'approved') are allowed.
+    Successful executions mark the approval as 'executed' so it cannot run again.
     """
     # Resolve command and approval
     cmd = request.command
@@ -810,56 +751,32 @@ def execute_command(request: ExecuteRequest):
 
     try:
         result = exec_service.execute(cmd, target, timeout=request.timeout)
-        return ExecutionResult(
-            approval_id=approval_id,
-            command=cmd,
-            target=target,
-            returncode=result.get("returncode", -1),
-            stdout=result.get("stdout", ""),
-            stderr=result.get("stderr", ""),
-            executed_at=datetime.now(timezone.utc),
-        )
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as exc:
         logger.error(f"Execution failed: {exc}")
         raise HTTPException(status_code=500, detail=f"Execution failed: {exc}")
 
-
-@router.post("/execute/direct", response_model=ExecutionResult)
-def execute_direct(request: ExecuteRequest):
-    """Execute a command immediately without an approval record. Use with caution.
-
-    This endpoint is intended for interactive UIs where the user explicitly confirms execution
-    of a model-suggested command. It requires `command` to be provided.
-    """
-    cmd = request.command
-    target = request.target
-
-    if not cmd:
-        raise HTTPException(status_code=400, detail="Direct execution requires a command")
-
+    returncode = result.get("returncode", -1)
     try:
-        result = exec_service.execute(cmd, target, timeout=request.timeout)
-        return ExecutionResult(
-            approval_id=None,
-            command=cmd,
-            target=target,
-            returncode=result.get("returncode", -1),
-            stdout=result.get("stdout", ""),
-            stderr=result.get("stderr", ""),
-            executed_at=datetime.now(timezone.utc),
-        )
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
+        approval_store.mark_executed(approval_id, note=f"executed with exit code {returncode}")
     except Exception as exc:
-        logger.error(f"Direct execution failed: {exc}")
-        raise HTTPException(status_code=500, detail=f"Direct execution failed: {exc}")
+        logger.warning(f"Failed to mark approval {approval_id} as executed: {exc}")
+
+    return ExecutionResult(
+        approval_id=approval_id,
+        command=cmd,
+        target=target,
+        returncode=returncode,
+        stdout=result.get("stdout", ""),
+        stderr=result.get("stderr", ""),
+        executed_at=datetime.now(timezone.utc),
+    )
 
 
 @router.get("/settings", response_model=SettingsResponse)
 def get_current_settings():
-    """Return current non-sensitive configuration."""
+    """Return current non-sensitive configuration. Secrets are write-only."""
     s = get_settings()
     return SettingsResponse(
         app_env=s.app_env,
@@ -875,11 +792,13 @@ def get_current_settings():
         proxmox_token_id=s.proxmox_token_id,
         proxmox_verify_ssl=s.proxmox_verify_ssl,
         qdrant_url=s.qdrant_url,
-        qdrant_api_key=s.qdrant_api_key,
         qdrant_current_collection_name=s.qdrant_current_collection_name,
         qdrant_history_collection_name=s.qdrant_history_collection_name,
+        qdrant_logs_collection_name=s.qdrant_logs_collection_name,
         ollama_url=s.ollama_url,
         ollama_model=s.ollama_model,
+        ollama_embed_model=s.ollama_embed_model,
+        ollama_num_ctx=s.ollama_num_ctx,
         loki_url=s.loki_url,
         prometheus_url=s.prometheus_url,
         approval_db_path=s.approval_db_path,
@@ -900,6 +819,8 @@ def update_settings(payload: SettingsUpdateRequest):
         if env_key is None:
             continue
         str_value = str(value) if not isinstance(value, bool) else str(value).lower()
+        # Strip newlines so a crafted value cannot inject extra .env lines.
+        str_value = str_value.replace("\n", " ").replace("\r", " ").strip()
         env[env_key] = str_value
         updated_fields.append(field_name)
 
@@ -937,8 +858,11 @@ _ENV_VAR_MAP: dict[str, str] = {
     "qdrant_api_key": "QDRANT_API_KEY",
     "qdrant_current_collection_name": "QDRANT_CURRENT_COLLECTION_NAME",
     "qdrant_history_collection_name": "QDRANT_HISTORY_COLLECTION_NAME",
+    "qdrant_logs_collection_name": "QDRANT_LOGS_COLLECTION_NAME",
     "ollama_url": "OLLAMA_URL",
     "ollama_model": "OLLAMA_MODEL",
+    "ollama_embed_model": "OLLAMA_EMBED_MODEL",
+    "ollama_num_ctx": "OLLAMA_NUM_CTX",
     "loki_url": "LOKI_URL",
     "prometheus_url": "PROMETHEUS_URL",
     "approval_db_path": "APPROVAL_DB_PATH",

@@ -1,66 +1,80 @@
 import hashlib
-from datetime import datetime
+import logging
+import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PointStruct,
+    VectorParams,
+)
 
 from backend.config.settings import Settings
+from backend.ollama.embeddings import OllamaEmbeddings
+
+logger = logging.getLogger(__name__)
+
+# Upper bound on points fetched when sorting client-side; homelab log volumes
+# stay far below this between ingestion runs.
+_SCROLL_WINDOW = 1024
 
 
 class LogStore:
     """Qdrant storage for log entries with semantic search capability."""
 
-    LOGS_COLLECTION = "logs"
-    VECTOR_SIZE = 4
-
     def __init__(self, settings: Settings):
-        self.client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
-        self.collection_name = settings.qdrant_current_collection_name.replace(
-            "infrastructure", "logs"
-        )  # e.g., logs_current
-        self.ensure_collection()
+        self.client = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key or None)
+        self.collection_name = settings.qdrant_logs_collection_name
+        self.embeddings = OllamaEmbeddings(settings)
 
     def ensure_collection(self):
-        """Create logs collection if it doesn't exist."""
+        """Create the logs collection, recreating it if the vector size changed."""
+        expected_size = self.embeddings.dimension()
         try:
-            self.client.get_collection(self.collection_name)
-        except Exception:
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=VectorParams(size=self.VECTOR_SIZE, distance=Distance.COSINE),
+            info = self.client.get_collection(self.collection_name)
+            current_size = info.config.params.vectors.size
+            if current_size == expected_size:
+                return
+            logger.warning(
+                f"Recreating '{self.collection_name}': vector size {current_size} != {expected_size} "
+                f"(embedding model changed)"
             )
+            self.client.delete_collection(self.collection_name)
+        except Exception:
+            pass
+        self.client.create_collection(
+            collection_name=self.collection_name,
+            vectors_config=VectorParams(size=expected_size, distance=Distance.COSINE),
+        )
 
     def store_logs(self, logs: list[dict], batch_id: str) -> int:
-        """
-        Store a batch of logs with semantic vectors.
-        
-        Args:
-            logs: List of log entries with timestamp, container, message
-            batch_id: Unique ID for this ingestion batch
-            
-        Returns:
-            Number of logs stored
-        """
+        """Embed and store a batch of logs. Returns the number of logs stored."""
         if not logs:
             return 0
 
+        self.ensure_collection()
+        texts = [f"{log.get('container', '')} {log.get('message', '')}" for log in logs]
+        vectors = self.embeddings.embed(texts)
+
         points = []
-        for idx, log in enumerate(logs):
-            point_id = self._generate_point_id(batch_id, idx, log)
-            vector = self._vector_from_log(log)
+        for idx, (log, vector) in enumerate(zip(logs, vectors)):
             payload = {
                 "batch_id": batch_id,
-                "timestamp": log.get("timestamp", datetime.utcnow().isoformat()),
+                "timestamp": log.get("timestamp", datetime.now(timezone.utc).isoformat()),
                 "container": log.get("container", "unknown"),
                 "message": log.get("message", ""),
                 "labels": log.get("labels", {}),
             }
-            points.append(PointStruct(id=point_id, vector=vector, payload=payload))
+            points.append(
+                PointStruct(id=self._generate_point_id(batch_id, idx, log), vector=vector, payload=payload)
+            )
 
-        if points:
-            self.client.upsert(collection_name=self.collection_name, points=points)
-
+        self.client.upsert(collection_name=self.collection_name, points=points)
         return len(points)
 
     def search_logs(
@@ -69,114 +83,69 @@ class LogStore:
         container: Optional[str] = None,
         limit: int = 10,
     ) -> list[dict]:
-        """
-        Semantic search over logs.
-        
-        Args:
-            query_text: Search query (e.g., "error in container")
-            container: Optional filter by container name
-            limit: Max results
-            
-        Returns:
-            List of matching log entries with relevance scores
-        """
-        query_vector = self._vector_from_text(query_text)
-        
-        # Build filter if container specified
-        filter_dict = None
-        if container:
-            filter_dict = {
-                "must": [
-                    {
-                        "key": "container",
-                        "match": {"value": container},
-                    }
-                ]
-            }
-
+        """Semantic search over ingested logs, optionally filtered by container."""
         try:
+            query_vector = self.embeddings.embed_one(query_text)
             results = self.client.search(
                 collection_name=self.collection_name,
                 query_vector=query_vector,
-                query_filter=filter_dict,
+                query_filter=self._container_filter(container),
                 limit=limit,
             )
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Log search failed: {exc}")
             return []
 
-        logs = []
-        for scored_point in results:
-            logs.append(
-                {
-                    "timestamp": scored_point.payload.get("timestamp"),
-                    "container": scored_point.payload.get("container"),
-                    "message": scored_point.payload.get("message"),
-                    "score": scored_point.score,
-                }
-            )
-
-        return logs
+        return [
+            {
+                "timestamp": point.payload.get("timestamp"),
+                "container": point.payload.get("container"),
+                "message": point.payload.get("message"),
+                "score": point.score,
+            }
+            for point in results
+        ]
 
     def get_recent_logs(
         self,
         container: Optional[str] = None,
         limit: int = 100,
     ) -> list[dict]:
-        """
-        Get most recent logs (by insertion order).
-        
-        Args:
-            container: Optional filter by container name
-            limit: Max results
-            
-        Returns:
-            List of recent log entries
-        """
+        """Get the most recent logs by timestamp, optionally filtered by container."""
         try:
-            points = self.client.scroll(
+            points, _ = self.client.scroll(
                 collection_name=self.collection_name,
-                limit=limit,
+                scroll_filter=self._container_filter(container),
+                limit=_SCROLL_WINDOW,
                 with_payload=True,
                 with_vectors=False,
             )
         except Exception as exc:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.error(f"Failed to scroll logs from Qdrant collection '{self.collection_name}': {exc}")
-            raise
+            logger.warning(f"Failed to scroll logs from '{self.collection_name}': {exc}")
+            return []
 
-        logs = []
-        for point in points[0]:
-            if container and point.payload.get("container") != container:
-                continue
-            logs.append(
-                {
-                    "timestamp": point.payload.get("timestamp"),
-                    "container": point.payload.get("container"),
-                    "message": point.payload.get("message"),
-                }
-            )
-
-        return logs
-
-    def _generate_point_id(self, batch_id: str, index: int, log: dict) -> int:
-        """Generate deterministic point ID."""
-        key = f"{batch_id}:{index}:{log.get('timestamp', '')}:{log.get('container', '')}"
-        hash_digest = hashlib.sha256(key.encode()).hexdigest()
-        # Convert first 8 hex chars to int
-        return int(hash_digest[:8], 16)
-
-    def _vector_from_log(self, log: dict) -> list[float]:
-        """Generate 4-dim vector from log entry."""
-        text = f"{log.get('container', '')} {log.get('message', '')}"
-        return self._vector_from_text(text)
-
-    def _vector_from_text(self, text: str) -> list[float]:
-        """Generate 4-dim vector from text via hash."""
-        hash_bytes = hashlib.sha256(text.encode()).digest()
-        # Split hash into 4 chunks, normalize to [0, 1]
-        vector = [
-            int.from_bytes(hash_bytes[i * 8 : (i + 1) * 8], "big") / (2**64)
-            for i in range(4)
+        logs = [
+            {
+                "timestamp": point.payload.get("timestamp", ""),
+                "container": point.payload.get("container", ""),
+                "message": point.payload.get("message", ""),
+                "labels": point.payload.get("labels", {}),
+            }
+            for point in points
         ]
-        return vector
+        # Qdrant scroll returns points in id order, so sort by timestamp here.
+        logs.sort(key=lambda log: log["timestamp"], reverse=True)
+        return logs[:limit]
+
+    @staticmethod
+    def _container_filter(container: Optional[str]) -> Optional[Filter]:
+        if not container:
+            return None
+        return Filter(must=[FieldCondition(key="container", match=MatchValue(value=container))])
+
+    @staticmethod
+    def _generate_point_id(batch_id: str, index: int, log: dict) -> str:
+        """Deterministic UUID so re-ingesting the same batch doesn't duplicate points."""
+        key = f"{batch_id}:{index}:{log.get('timestamp', '')}:{log.get('container', '')}"
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        return str(uuid.UUID(hex=digest[:32]))

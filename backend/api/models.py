@@ -99,8 +99,6 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     query: str
-    include_logs: bool = True
-    log_limit: int = Field(20, ge=1, le=200)
     model: str | None = None
     history: list[ChatMessage] = Field(default_factory=list)
 
@@ -183,12 +181,15 @@ class SettingsResponse(BaseModel):
     proxmox_user: str = "ai-stack"
     proxmox_token_id: str = "assistant"
     proxmox_verify_ssl: bool = False
+    # qdrant_api_key is intentionally absent: secrets are write-only.
     qdrant_url: str = ""
-    qdrant_api_key: str = ""
     qdrant_current_collection_name: str = "infrastructure_current"
     qdrant_history_collection_name: str = "infrastructure_history"
+    qdrant_logs_collection_name: str = "logs_current"
     ollama_url: str = ""
-    ollama_model: str = "llama3.1:8b"
+    ollama_model: str = "gemma4:e4b"
+    ollama_embed_model: str = "nomic-embed-text"
+    ollama_num_ctx: int = 4096
     loki_url: str = ""
     prometheus_url: str = ""
     approval_db_path: str = "data/approvals.sqlite3"
@@ -213,8 +214,11 @@ class SettingsUpdateRequest(BaseModel):
     qdrant_api_key: str | None = None
     qdrant_current_collection_name: str | None = None
     qdrant_history_collection_name: str | None = None
+    qdrant_logs_collection_name: str | None = None
     ollama_url: str | None = None
     ollama_model: str | None = None
+    ollama_embed_model: str | None = None
+    ollama_num_ctx: int | None = None
     loki_url: str | None = None
     prometheus_url: str | None = None
     approval_db_path: str | None = None

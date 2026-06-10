@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -14,6 +15,7 @@ os.environ.setdefault("PROMETHEUS_URL", "http://prometheus.local")
 import backend.api.routes as routes_mod
 from backend.api.main import app
 from backend.config.settings import Settings
+from backend.execution.service import ExecutionService
 
 
 class FakeApprovalStore:
@@ -56,11 +58,26 @@ class FakeApprovalStore:
         item["review_note"] = note
         return item
 
+    def mark_executed(self, approval_id, note=None):
+        item = self._store.get(approval_id)
+        if not item:
+            return None
+        item["updated_at"] = datetime.now(timezone.utc)
+        item["status"] = "executed"
+        if note:
+            item["review_note"] = note
+        return item
+
+    def delete(self, approval_id):
+        return self._store.pop(approval_id, None) is not None
+
+    def cleanup(self, remove_empty=True, action=None, statuses=None):
+        return 0
+
 
 def test_approval_to_execute_flow(monkeypatch):
     client = TestClient(app)
 
-    # Replace approval_store with fake
     fake_store = FakeApprovalStore()
     monkeypatch.setattr(routes_mod, "approval_store", fake_store)
 
@@ -97,166 +114,62 @@ def test_approval_to_execute_flow(monkeypatch):
     assert result["returncode"] == 0
     assert result["stdout"] == "ok"
 
+    # Executed approvals must not be runnable again
+    assert fake_store.get(approval_id)["status"] == "executed"
 
-def test_direct_execute_ignores_target_metadata(monkeypatch):
+
+def test_execute_requires_approval():
     client = TestClient(app)
 
-    def fake_execute(cmd, target, timeout=30):
-        assert cmd == "tail -n 1 /etc/hosts"
-        assert target == "vm-100"
-        assert timeout == 12
-        return {"returncode": 0, "stdout": "ok", "stderr": ""}
+    resp = client.post("/execute", json={"command": "tail -n 1 /etc/hosts"})
+    assert resp.status_code == 400
 
-    monkeypatch.setattr(routes_mod.exec_service, "execute", fake_execute)
-
-    resp = client.post(
-        "/execute/direct",
-        json={"command": "tail -n 1 /etc/hosts", "target": "vm-100", "timeout": 12},
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["target"] == "vm-100"
-    assert data["stdout"] == "ok"
+    resp = client.post("/execute", json={})
+    assert resp.status_code == 400
 
 
-def test_proxvnc_execution_uses_password_auth(monkeypatch):
-    import backend.execution.service as exec_mod
+def test_execute_rejects_unapproved(monkeypatch):
+    client = TestClient(app)
 
-    class FakeSettings:
-        proxmox_url = ""
-        proxmox_host_ip = "10.0.0.50"
-        proxmox_ip = None
-        proxmox_port = 8006
-        proxmox_user = "ai-stack"
-        proxmox_realm = "pve"
-        proxmox_token_id = "assistant"
-        proxmox_token_secret = "secret"
-        proxmox_password = "password"
-        proxmox_otp = None
-        proxmox_pve_auth_cookie = None
-        proxmox_verify_ssl = False
+    fake_store = FakeApprovalStore()
+    monkeypatch.setattr(routes_mod, "approval_store", fake_store)
 
-    class FakeNodes:
-        def get(self):
-            return [{"node": "pve"}]
-
-    class FakeAPI:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.nodes = FakeNodes()
-
-    class FakeVNC:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.connected = False
-            self.commands = []
-
-        def connect(self):
-            self.connected = True
-
-        def execCommandAsB64(self, command, wait_time=0.5):
-            self.commands.append((command, wait_time))
-
-        def readTerm(self, waitTime=0.5):
-            return "command output\n__PROXVNC_EXIT__:0\n"
-
-        def disconnect(self):
-            self.connected = False
-
-    monkeypatch.setattr(exec_mod, "get_settings", lambda: FakeSettings())
-    monkeypatch.setattr(exec_mod, "ProxmoxApiClient", FakeAPI)
-    monkeypatch.setattr(exec_mod, "ProxVNCClient", FakeVNC)
-
-    result = exec_mod.ExecutionService().execute("tail -n 1 /etc/hosts", timeout=4)
-
-    assert result["returncode"] == 0
-    assert "command output" in result["stdout"]
+    created = fake_store.create("tail_logs", "tail -n 1 /etc/hosts", None, "low", None, "tester")
+    resp = client.post("/execute", json={"approval_id": created["id"]})
+    assert resp.status_code == 400
 
 
-def test_proxvnc_execution_can_use_cookie_auth(monkeypatch):
-    import backend.execution.service as exec_mod
+def test_command_validation_allowlist():
+    service = ExecutionService()
 
-    class FakeSettings:
-        proxmox_url = ""
-        proxmox_host_ip = "10.0.0.50"
-        proxmox_ip = None
-        proxmox_port = 8006
-        proxmox_user = "ai-stack"
-        proxmox_realm = "pve"
-        proxmox_token_id = "assistant"
-        proxmox_token_secret = "secret"
-        proxmox_password = None
-        proxmox_otp = None
-        proxmox_pve_auth_cookie = "PVEAuthCookie=abc123"
-        proxmox_verify_ssl = False
+    # Diagnostic commands pass
+    assert service.validate("df -h") == ["df", "-h"]
+    assert service.validate("pct list") == ["pct", "list"]
+    assert service.validate("systemctl status nginx")[0] == "systemctl"
 
-    class FakeTermproxy:
-        def post(self):
-            return {"ticket": "ticket-1", "port": 5900}
+    # Blocked binaries
+    with pytest.raises(ValueError):
+        service.validate("rm -rf /")
+    with pytest.raises(ValueError):
+        service.validate("shutdown now")
 
-    class FakeNodeResource:
-        def __init__(self, node):
-            self.node = node
-            self.termproxy = FakeTermproxy()
+    # Destructive subcommands of allowed binaries are rejected
+    with pytest.raises(ValueError):
+        service.validate("pct destroy 101")
+    with pytest.raises(ValueError):
+        service.validate("qm destroy 101")
+    with pytest.raises(ValueError):
+        service.validate("systemctl poweroff")
+    with pytest.raises(ValueError):
+        service.validate("pvesh delete /nodes/pve/lxc/101")
 
-    class FakeNodes:
-        def get(self):
-            return [{"node": "pve"}]
-
-        def __call__(self, node):
-            return FakeNodeResource(node)
-
-    class FakeAPI:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.nodes = FakeNodes()
-
-    class FakeVNC:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.commands = []
-
-        def connect(self):
-            return None
-
-        def execCommandAsB64(self, command, wait_time=0.5):
-            self.commands.append((command, wait_time))
-
-        def readTerm(self, waitTime=0.5):
-            return "ok\n__PROXVNC_EXIT__:0\n"
-
-        def disconnect(self):
-            return None
-
-    class FakeResponse:
-        def __init__(self):
-            self.status_code = 200
-
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {"data": {"ticket": "ticket-1", "port": 5900}}
-
-    class FakeRequests:
-        def post(self, url, headers=None, verify=True, timeout=10, **kwargs):
-            return FakeResponse()
-
-    fake_requests = FakeRequests()
-
-    monkeypatch.setattr(exec_mod, "get_settings", lambda: FakeSettings())
-    monkeypatch.setattr(exec_mod, "ProxmoxApiClient", FakeAPI)
-    monkeypatch.setattr(exec_mod, "ProxVNCClient", FakeVNC)
-
-    # The service imports `requests` inside _connect_client; patch it on the built-in module
-    import requests as real_requests
-    monkeypatch.setattr(real_requests, "post", fake_requests.post)
-
-    result = exec_mod.ExecutionService().execute("ls /", target="ct1", timeout=3)
-
-    assert result["returncode"] == 0
-    assert result["node"] == "pve"
-    assert result["stdout"].startswith("ok")
+    # Shell metacharacters and path tricks are rejected
+    with pytest.raises(ValueError):
+        service.validate("df -h; rm -rf /")
+    with pytest.raises(ValueError):
+        service.validate("cat /etc/passwd | grep root")
+    with pytest.raises(ValueError):
+        service.validate("/usr/bin/df -h")
 
 
 def test_proxmox_ip_builds_api_base_url():
@@ -276,77 +189,69 @@ def test_proxmox_ip_builds_api_base_url():
         prometheus_url="http://prometheus.local",
     )
 
-    assert settings.proxmox_api_base_url == "http://10.0.0.50:8006"
+    # Proxmox always serves the API over HTTPS; verify_ssl only controls validation.
+    assert settings.proxmox_api_base_url == "https://10.0.0.50:8006"
     assert settings.proxmox_auth_header == "PVEAPIToken=ai-stack@pve!assistant=secret"
 
 
-def test_chat_scans_containers_when_model_requests_it(monkeypatch):
+def test_chat_returns_model_answer(monkeypatch):
     client = TestClient(app)
-
-    class FakeSnapshotStore:
-        def __init__(self, settings):
-            self.settings = settings
-
-        def list_current_infrastructure(self):
-            return []
-
-    class FakeProxmoxClient:
-        def __init__(self, settings):
-            self.settings = settings
-
-        def scan_inventory(self):
-            return {
-                "containers": [
-                    {
-                        "vmid": 101,
-                        "name": "ct1",
-                        "type": "lxc",
-                        "node": "pve",
-                        "status": "running",
-                        "ip": "10.0.0.10",
-                    }
-                ],
-                "scanned_nodes": 1,
-                "diagnostics": [],
-            }
 
     class FakeOllamaClient:
         def __init__(self, settings):
             self.settings = settings
-            self.prompts = []
+            self.model = "fake-model"
 
-        def list_models(self):
-            return []
-
-        def generate_json(self, prompt, system_prompt=""):
-            self.prompts.append(prompt)
-            if len(self.prompts) == 1:
-                return {"tool_call": {"name": "scan_containers", "args": {}}}
+        def chat(self, messages, tools=None):
+            # The endpoint must send the system prompt, history, and query
+            assert messages[0]["role"] == "system"
+            assert messages[-1] == {"role": "user", "content": "What containers are running?"}
             return {
                 "summary": "scan complete",
                 "reasoning": "used refreshed inventory",
                 "confidence": 0.9,
                 "suggested_actions": [
                     {
-                        "action": "Check resource usage",
-                        "command": "pct top 101",
+                        "action": "Check container status",
+                        "command": "pct status 101",
                         "target": "ct1",
                         "risk": "low",
                     }
                 ],
             }
 
-    monkeypatch.setattr(routes_mod, "SnapshotStore", FakeSnapshotStore)
-    monkeypatch.setattr(routes_mod, "ProxmoxClient", FakeProxmoxClient)
     monkeypatch.setattr(routes_mod, "OllamaClient", FakeOllamaClient)
 
     resp = client.post(
         "/chat",
-        json={"query": "What containers are running?", "include_logs": False, "log_limit": 1, "model": None},
+        json={"query": "What containers are running?", "model": None, "history": []},
     )
 
     assert resp.status_code == 200
     data = resp.json()
     assert data["summary"] == "scan complete"
-    assert data["context"]["infrastructure_count"] == 1
-    assert data["suggested_actions"][0]["command"] == "pct top 101"
+    assert data["confidence"] == 0.9
+    assert data["suggested_actions"][0]["command"] == "pct status 101"
+
+
+def test_chat_history_is_capped(monkeypatch):
+    client = TestClient(app)
+    seen = {}
+
+    class FakeOllamaClient:
+        def __init__(self, settings):
+            self.model = "fake-model"
+
+        def chat(self, messages, tools=None):
+            seen["messages"] = messages
+            return {"summary": "ok", "reasoning": "", "confidence": 1.0, "suggested_actions": []}
+
+    monkeypatch.setattr(routes_mod, "OllamaClient", FakeOllamaClient)
+
+    history = [{"role": "user", "content": f"msg {i}"} for i in range(30)]
+    resp = client.post("/chat", json={"query": "latest", "history": history})
+    assert resp.status_code == 200
+
+    # system prompt + capped history + current query
+    assert len(seen["messages"]) == 1 + routes_mod.MAX_HISTORY_MESSAGES + 1
+    assert seen["messages"][1]["content"] == f"msg {30 - routes_mod.MAX_HISTORY_MESSAGES}"
