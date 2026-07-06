@@ -51,6 +51,17 @@ class ExecutionService:
         },
     }
 
+    # Some allow-listed binaries have flags that turn a read-only diagnostic
+    # tool into an arbitrary-command or destructive one. `find -exec rm ...`
+    # would otherwise run `rm` even though it is in BLOCKED, because BLOCKED
+    # only inspects argv[0]. These flags are rejected regardless of position.
+    DANGEROUS_FLAGS = {
+        "find": {
+            "-exec", "-execdir", "-ok", "-okdir", "-delete",
+            "-fprint", "-fprintf", "-fprint0", "-fls",
+        },
+    }
+
     SHELL_DANGERS = re.compile(r"[;&|`$<>]")
 
     def validate(self, command: str) -> list[str]:
@@ -88,6 +99,14 @@ class ExecutionService:
                     + f" is not an allowed subcommand (allowed: {', '.join(sorted(allowed_subcommands))})"
                 )
 
+        dangerous_flags = self.DANGEROUS_FLAGS.get(head)
+        if dangerous_flags:
+            for token in parts[1:]:
+                if token in dangerous_flags:
+                    raise ValueError(
+                        f"Flag '{token}' is not allowed for '{head}'"
+                    )
+
         return parts
 
     def _normalize_command(self, command: str) -> str:
@@ -100,7 +119,17 @@ class ExecutionService:
     def _get_ssh_client(settings) -> paramiko.SSHClient:
         """Create an authenticated SSH client to the Proxmox node."""
         client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.load_system_host_keys()
+        if getattr(settings, "proxmox_ssh_strict_host_key", False):
+            # Reject unknown hosts; operator must pre-populate known_hosts.
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        else:
+            logger.warning(
+                "SSH host-key verification is disabled (AutoAddPolicy). "
+                "Set PROXMOX_SSH_STRICT_HOST_KEY=true and populate known_hosts "
+                "to protect against man-in-the-middle attacks."
+            )
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         host = settings.proxmox_host_ip or settings.proxmox_ip or "192.168.1.147"
         user = settings.proxmox_user.split("@")[0]  # strip realm (e.g. "root@pam" -> "root")

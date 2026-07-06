@@ -110,8 +110,47 @@ class ApprovalStore:
                 )
             return self.get(approval_id)
 
+    def claim_for_execution(self, approval_id: str) -> Optional[dict]:
+        """Atomically transition an approved item to 'executing'.
+
+        Returns the claimed record only if this caller won the race (the row
+        was 'approved' and is now 'executing'). Returns None if the approval
+        does not exist, is not approved, or was already claimed by a concurrent
+        request. This closes the check-then-execute TOCTOU window that would
+        otherwise let the same approved command run twice.
+        """
+        with self._lock:
+            updated_at = datetime.now(timezone.utc).isoformat()
+            with self._conn:
+                cur = self._conn.execute(
+                    "UPDATE approvals SET status = 'executing', updated_at = ? "
+                    "WHERE id = ? AND status = 'approved'",
+                    (updated_at, approval_id),
+                )
+            if cur.rowcount != 1:
+                return None
+            return self.get(approval_id)
+
+    def release_claim(self, approval_id: str, note: Optional[str] = None) -> Optional[dict]:
+        """Revert an 'executing' claim back to 'approved' after a failed run,
+        so a transient error does not strand the approval."""
+        with self._lock:
+            updated_at = datetime.now(timezone.utc).isoformat()
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE approvals SET status = 'approved', "
+                    "review_note = COALESCE(?, review_note), updated_at = ? "
+                    "WHERE id = ? AND status = 'executing'",
+                    (note, updated_at, approval_id),
+                )
+            return self.get(approval_id)
+
     def mark_executed(self, approval_id: str, note: Optional[str] = None) -> Optional[dict]:
-        """Mark an approved item as executed so it cannot be re-run from the UI."""
+        """Mark a claimed item as executed so it cannot be re-run from the UI.
+
+        Only transitions from 'executing' (set by claim_for_execution), so a
+        stale or duplicated call cannot flip an unrelated status to 'executed'.
+        """
         with self._lock:
             current = self.get(approval_id)
             if not current:
@@ -119,7 +158,9 @@ class ApprovalStore:
             updated_at = datetime.now(timezone.utc).isoformat()
             with self._conn:
                 self._conn.execute(
-                    "UPDATE approvals SET status = 'executed', review_note = COALESCE(?, review_note), updated_at = ? WHERE id = ?",
+                    "UPDATE approvals SET status = 'executed', "
+                    "review_note = COALESCE(?, review_note), updated_at = ? "
+                    "WHERE id = ? AND status = 'executing'",
                     (note, updated_at, approval_id),
                 )
             return self.get(approval_id)
