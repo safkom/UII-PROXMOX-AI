@@ -754,9 +754,16 @@ def execute_command(request: ExecuteRequest):
     if not claimed:
         raise HTTPException(status_code=409, detail="Approval is already being executed")
 
-    if not cmd:
-        cmd = claimed.get("command")
-        target = claimed.get("target")
+    # Only the command stored on the approval may run — a client-supplied
+    # command must match it exactly, otherwise the approval would no longer
+    # bind what actually executes.
+    approved_cmd = (claimed.get("command") or "").strip()
+    if cmd and approved_cmd and cmd.strip() != approved_cmd:
+        approval_store.release_claim(approval_id, note="client command did not match approved command")
+        raise HTTPException(status_code=400, detail="Command does not match the approved command")
+
+    cmd = approved_cmd
+    target = claimed.get("target") or target
 
     if not cmd:
         approval_store.release_claim(approval_id, note="no command available to execute")
@@ -805,6 +812,7 @@ def get_current_settings():
         proxmox_realm=s.proxmox_realm,
         proxmox_user=s.proxmox_user,
         proxmox_token_id=s.proxmox_token_id,
+        proxmox_ssh_user=s.proxmox_ssh_user,
         proxmox_verify_ssl=s.proxmox_verify_ssl,
         qdrant_url=s.qdrant_url,
         qdrant_current_collection_name=s.qdrant_current_collection_name,
@@ -868,6 +876,7 @@ _ENV_VAR_MAP: dict[str, str] = {
     "proxmox_token_id": "PROXMOX_TOKEN_ID",
     "proxmox_token_secret": "PROXMOX_TOKEN_SECRET",
     "proxmox_password": "PROXMOX_PASSWORD",
+    "proxmox_ssh_user": "PROXMOX_SSH_USER",
     "proxmox_verify_ssl": "PROXMOX_VERIFY_SSL",
     "qdrant_url": "QDRANT_URL",
     "qdrant_api_key": "QDRANT_API_KEY",

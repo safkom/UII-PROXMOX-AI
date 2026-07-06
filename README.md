@@ -24,8 +24,11 @@ diagnostične ukaze, ki se izvedejo šele po izrecni človeški odobritvi.
   Predlaga strukturirano akcijo; zaledje jo preveri proti seznamu dovoljenih
   ukazov (vključno s pravili za podukaze `pct`/`qm`/`pvesh`/`systemctl` in
   prepovedjo posebnih znakov lupine); uporabnik jo v vmesniku odobri ali
-  zavrne; šele nato se ukaz izvede prek SSH na Proxmox vozlišču, odobritev pa
-  se označi kot izvedena, da je ni mogoče pognati znova.
+  zavrne; šele nato se ukaz izvede, odobritev pa se označi kot izvedena, da je
+  ni mogoče pognati znova. Akcije `pct/qm start/stop` gredo prek Proxmox API
+  (asinhroni task z UPID, deluje na katerem koli vozlišču gruče, zahteva
+  privilegij `VM.PowerMgmt` na žetonu); ostali diagnostični ukazi se izvedejo
+  prek SSH na Proxmox vozlišču (`PROXMOX_SSH_USER`).
 - **Lasten spletni vmesnik** — ročno napisana enostranska aplikacija v čistem
   JS/CSS: klepet (pretakanje odgovorov, vidni klici orodij in razmislek),
   inventar vsebnikov, brskalnik dnevnikov s semantičnim iskanjem, čakalna
@@ -49,8 +52,11 @@ ollama pull nomic-embed-text    # model za vložitve za RAG (OLLAMA_EMBED_MODEL)
 ```
 
 Kopiraj `.env.example` v `.env` ter vpiši svoje naslove storitev in skrivnost
-Proxmox API žetona. Če zaledje teče lokalno in se povezuje na Proxmox na drugem
-računalniku, nastavi `PROXMOX_HOST_IP` in `PROXMOX_PORT`. `OLLAMA_NUM_CTX`
+Proxmox API žetona. Žeton potrebuje privilegije `Sys.Audit` in `VM.Audit`
+(inventar) ter `VM.PowerMgmt` (zagon/zaustavitev gostov prek API-ja). Če
+zaledje teče lokalno in se povezuje na Proxmox na drugem računalniku, nastavi
+`PROXMOX_HOST_IP` in `PROXMOX_PORT`; za SSH izvajanje nastavi še
+`PROXMOX_SSH_USER` (Unix račun na vozlišču, običajno `root`). `OLLAMA_NUM_CTX`
 omejuje kontekstno okno na zahtevo — na šibkejših grafičnih karticah naj
 ostane zmeren (4096).
 

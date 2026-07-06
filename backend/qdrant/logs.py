@@ -86,12 +86,14 @@ class LogStore:
         """Semantic search over ingested logs, optionally filtered by container."""
         try:
             query_vector = self.embeddings.embed_one(query_text)
-            results = self.client.search(
+            # query_points replaces the legacy search(), which was removed in
+            # newer qdrant-client releases (requirements pin only >=1.10).
+            results = self.client.query_points(
                 collection_name=self.collection_name,
-                query_vector=query_vector,
+                query=query_vector,
                 query_filter=self._container_filter(container),
                 limit=limit,
-            )
+            ).points
         except Exception as exc:
             logger.warning(f"Log search failed: {exc}")
             return []

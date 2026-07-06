@@ -1,18 +1,22 @@
-"""SSH-backed execution service for diagnostic commands.
+"""Execution service for approved diagnostic commands.
 
-Runs approved commands on the Proxmox node via SSH using password or
-key-based authentication.
+Guest power actions (pct/qm start/stop) run through the Proxmox API as
+async tasks; all other allow-listed commands run on the Proxmox node via
+SSH using password authentication.
 """
 from __future__ import annotations
 
 import logging
 import re
 import shlex
+import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import paramiko
 
 from backend.config.settings import get_settings
+from backend.proxmox.client import ProxmoxClient
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +68,18 @@ class ExecutionService:
 
     SHELL_DANGERS = re.compile(r"[;&|`$<>]")
 
+    # Guest power actions are routed to the Proxmox API instead of SSH:
+    # POST /nodes/{node}/{lxc|qemu}/{vmid}/status/{start|stop} returns a task
+    # UPID we poll. This works for guests on any cluster node (SSH always
+    # lands on one host, but pct/qm must run on the node hosting the guest)
+    # and needs only the VM.PowerMgmt privilege instead of a root shell.
+    API_POWER_COMMANDS = {
+        ("pct", "start"): "lxc",
+        ("pct", "stop"): "lxc",
+        ("qm", "start"): "qemu",
+        ("qm", "stop"): "qemu",
+    }
+
     def validate(self, command: str) -> list[str]:
         if not command or not command.strip():
             raise ValueError("Empty command")
@@ -109,12 +125,6 @@ class ExecutionService:
 
         return parts
 
-    def _normalize_command(self, command: str) -> str:
-        parts = self.validate(command)
-        if hasattr(shlex, "join"):
-            return shlex.join(parts)
-        return " ".join(shlex.quote(part) for part in parts)
-
     @staticmethod
     def _get_ssh_client(settings) -> paramiko.SSHClient:
         """Create an authenticated SSH client to the Proxmox node."""
@@ -131,8 +141,28 @@ class ExecutionService:
             )
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        host = settings.proxmox_host_ip or settings.proxmox_ip or "192.168.1.147"
-        user = settings.proxmox_user.split("@")[0]  # strip realm (e.g. "root@pam" -> "root")
+        host = settings.proxmox_host_ip or settings.proxmox_ip
+        if not host:
+            # Fall back to the host part of the configured API URL.
+            try:
+                host = urlparse(settings.proxmox_api_base_url).hostname
+            except ValueError:
+                host = None
+        if not host:
+            raise RuntimeError(
+                "No SSH host configured. Set PROXMOX_HOST_IP (or PROXMOX_IP / PROXMOX_URL) in .env."
+            )
+
+        user = settings.proxmox_ssh_user
+        if not user:
+            # The API identity (PROXMOX_USER, e.g. "ai-stack") is usually not a
+            # Unix account on the node; SSH needs its own login.
+            user = settings.proxmox_user.split("@")[0]  # strip realm ("root@pam" -> "root")
+            logger.warning(
+                "PROXMOX_SSH_USER is not set; falling back to API user '%s' for SSH login. "
+                "Set PROXMOX_SSH_USER (e.g. 'root') if this is not a Unix account on the node.",
+                user,
+            )
 
         connect_kwargs: dict = {
             "hostname": host,
@@ -154,18 +184,68 @@ class ExecutionService:
         return client
 
     def execute(self, command: str, target: Optional[str] = None, timeout: int = 30) -> dict:
-        """Execute a validated command on the Proxmox node via SSH.
+        """Execute a validated command: guest power actions go through the
+        Proxmox API, everything else runs on the Proxmox node via SSH.
 
         Args:
             command: shell-like command string (validated)
-            target: ignored for SSH (node is determined by settings)
+            target: ignored (the node is resolved from settings / the cluster)
             timeout: seconds before timing out
 
         Returns:
-            dict with returncode, stdout, stderr
+            dict with returncode, stdout, stderr, node
         """
-        normalized_command = self._normalize_command(command)
+        parts = self.validate(command)
         settings = get_settings()
+
+        subcommand = parts[1] if len(parts) > 1 else ""
+        guest_type = self.API_POWER_COMMANDS.get((parts[0], subcommand))
+        if guest_type is not None:
+            return self._execute_power_via_api(parts, guest_type, settings, timeout)
+
+        return self._execute_via_ssh(parts, settings, timeout)
+
+    def _execute_power_via_api(self, parts: list[str], guest_type: str, settings, timeout: int) -> dict:
+        """Run pct/qm start/stop as a Proxmox API power action and wait for the task."""
+        tool, action, *rest = parts
+        if len(rest) != 1 or not rest[0].isdigit():
+            raise ValueError(f"'{tool} {action}' requires exactly one numeric vmid")
+        vmid = int(rest[0])
+
+        client = ProxmoxClient(settings)
+        guest = client.find_guest(vmid)
+        if guest is None:
+            raise ValueError(f"No guest with vmid {vmid} found on the cluster")
+        if guest.get("type") != guest_type:
+            other_tool = "qm" if tool == "pct" else "pct"
+            raise ValueError(
+                f"vmid {vmid} is a {guest.get('type')} guest; use '{other_tool} {action} {vmid}'"
+            )
+
+        node = guest["node"]
+        logger.info(f"Executing via Proxmox API on {node}: {tool} {action} {vmid}")
+        if action == "start":
+            upid = client.start_guest(node, vmid, guest_type)
+        else:
+            upid = client.stop_guest(node, vmid, guest_type)
+        if not upid:
+            raise RuntimeError(f"Proxmox did not return a task UPID for {action} of vmid {vmid}")
+
+        task = client.wait_for_task(node, upid, timeout=max(timeout, 30))
+        exitstatus = task.get("exitstatus", "")
+        ok = exitstatus == "OK"
+        return {
+            "returncode": 0 if ok else 1,
+            "stdout": f"Proxmox API task {upid}: {exitstatus or task.get('status', 'unknown')}",
+            "stderr": "" if ok else f"Task finished with exitstatus: {exitstatus or 'unknown'}",
+            "node": node,
+        }
+
+    def _execute_via_ssh(self, parts: list[str], settings, timeout: int) -> dict:
+        if hasattr(shlex, "join"):
+            normalized_command = shlex.join(parts)
+        else:
+            normalized_command = " ".join(shlex.quote(part) for part in parts)
         node = settings.proxmox_node or "proxmox"
 
         client = self._get_ssh_client(settings)
@@ -174,14 +254,37 @@ class ExecutionService:
             stdin, stdout, stderr = client.exec_command(
                 normalized_command, timeout=timeout
             )
-            exit_code = stdout.channel.recv_exit_status()
-            out = stdout.read().decode("utf-8", errors="replace")
-            err = stderr.read().decode("utf-8", errors="replace")
+            channel = stdout.channel
+            out_buf = bytearray()
+            err_buf = bytearray()
+
+            # Drain both streams while waiting for the command to exit. Calling
+            # recv_exit_status() first would deadlock on large output: once the
+            # SSH window fills, the remote blocks writing and never exits.
+            deadline = time.monotonic() + timeout
+            while not channel.exit_status_ready():
+                drained = False
+                while channel.recv_ready():
+                    out_buf.extend(channel.recv(32768))
+                    drained = True
+                while channel.recv_stderr_ready():
+                    err_buf.extend(channel.recv_stderr(32768))
+                    drained = True
+                if time.monotonic() > deadline:
+                    channel.close()
+                    raise RuntimeError(f"Command timed out after {timeout}s")
+                if not drained:
+                    time.sleep(0.05)
+
+            exit_code = channel.recv_exit_status()
+            # The exit status arrives with EOF, so these reads cannot block.
+            out_buf.extend(stdout.read())
+            err_buf.extend(stderr.read())
 
             return {
                 "returncode": exit_code,
-                "stdout": out.rstrip(),
-                "stderr": err.rstrip(),
+                "stdout": out_buf.decode("utf-8", errors="replace").rstrip(),
+                "stderr": err_buf.decode("utf-8", errors="replace").rstrip(),
                 "node": node,
             }
         except Exception as exc:
