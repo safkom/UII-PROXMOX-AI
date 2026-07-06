@@ -180,6 +180,7 @@ class SettingsResponse(BaseModel):
     proxmox_realm: str = "pve"
     proxmox_user: str = "ai-stack"
     proxmox_token_id: str = "assistant"
+    proxmox_ssh_user: str | None = None
     proxmox_verify_ssl: bool = False
     # qdrant_api_key is intentionally absent: secrets are write-only.
     qdrant_url: str = ""
@@ -209,6 +210,7 @@ class SettingsUpdateRequest(BaseModel):
     proxmox_token_id: str | None = None
     proxmox_token_secret: str | None = None
     proxmox_password: str | None = None
+    proxmox_ssh_user: str | None = None
     proxmox_verify_ssl: bool | None = None
     qdrant_url: str | None = None
     qdrant_api_key: str | None = None

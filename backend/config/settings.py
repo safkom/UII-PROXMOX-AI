@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     proxmox_verify_ssl: bool = Field(False)
     proxmox_request_timeout: int = Field(15)
     proxmox_ssh_strict_host_key: bool = Field(False)
+    # Unix login for SSH command execution on the node. Separate from
+    # proxmox_user, which is the API token identity (e.g. "ai-stack@pve").
+    proxmox_ssh_user: str | None = Field(default=None)
 
     qdrant_url: str = Field(...)
     qdrant_api_key: str = Field("")

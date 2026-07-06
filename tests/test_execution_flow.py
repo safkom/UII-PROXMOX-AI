@@ -253,6 +253,35 @@ def test_execute_conflict_on_double_run(monkeypatch):
     assert resp.status_code == 409
 
 
+def test_execute_rejects_command_mismatch(monkeypatch):
+    """A client-supplied command that differs from the approved one must not run."""
+    client = TestClient(app)
+
+    fake_store = FakeApprovalStore()
+    monkeypatch.setattr(routes_mod, "approval_store", fake_store)
+
+    created = fake_store.create("tail_logs", "tail -n 1 /etc/hosts", None, "low", None, "tester")
+    fake_store.decide(created["id"], "approved", "admin", "ok")
+
+    def fail_execute(cmd, target, timeout=30):
+        raise AssertionError("mismatched command must not execute")
+
+    monkeypatch.setattr(routes_mod.exec_service, "execute", fail_execute)
+
+    resp = client.post("/execute", json={"approval_id": created["id"], "command": "cat /etc/shadow"})
+    assert resp.status_code == 400
+
+    # The claim is released so the approval stays runnable with its own command.
+    assert fake_store.get(created["id"])["status"] == "approved"
+
+    monkeypatch.setattr(
+        routes_mod.exec_service, "execute",
+        lambda cmd, target, timeout=30: {"returncode": 0, "stdout": "ok", "stderr": ""},
+    )
+    resp = client.post("/execute", json={"approval_id": created["id"], "command": "tail -n 1 /etc/hosts"})
+    assert resp.status_code == 200
+
+
 def test_api_auth_optional_token(monkeypatch):
     from backend.config.settings import get_settings
 
