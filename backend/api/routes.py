@@ -733,28 +733,43 @@ def execute_command(request: ExecuteRequest):
     target = request.target
     approval_id = request.approval_id
 
-    if approval_id:
-        existing = approval_store.get(approval_id)
-        if not existing:
-            raise HTTPException(status_code=404, detail="Approval not found")
-        if existing.get("status") != "approved":
-            raise HTTPException(status_code=400, detail="Approval is not approved for execution")
-        if not cmd:
-            cmd = existing.get("command")
-            target = existing.get("target")
-    else:
+    if not approval_id:
         # For safety, disallow executions without an approval record in this MVP
         raise HTTPException(status_code=400, detail="Execution requires an approved approval_id")
 
+    existing = approval_store.get(approval_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Approval not found")
+
+    status = existing.get("status")
+    if status in ("executing", "executed"):
+        raise HTTPException(status_code=409, detail="Approval has already been executed")
+    if status != "approved":
+        raise HTTPException(status_code=400, detail="Approval is not approved for execution")
+
+    # Atomically claim the approval so two concurrent /execute calls cannot both
+    # run the same approved command (TOCTOU). Only the caller that flips
+    # approved -> executing proceeds; the loser gets a 409.
+    claimed = approval_store.claim_for_execution(approval_id)
+    if not claimed:
+        raise HTTPException(status_code=409, detail="Approval is already being executed")
+
     if not cmd:
+        cmd = claimed.get("command")
+        target = claimed.get("target")
+
+    if not cmd:
+        approval_store.release_claim(approval_id, note="no command available to execute")
         raise HTTPException(status_code=400, detail="No command available to execute")
 
     try:
         result = exec_service.execute(cmd, target, timeout=request.timeout)
     except ValueError as ve:
+        approval_store.release_claim(approval_id, note=f"validation failed: {ve}")
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as exc:
         logger.error(f"Execution failed: {exc}")
+        approval_store.release_claim(approval_id, note=f"execution error: {exc}")
         raise HTTPException(status_code=500, detail=f"Execution failed: {exc}")
 
     returncode = result.get("returncode", -1)

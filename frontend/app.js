@@ -2,8 +2,21 @@
 // Proxmox AI — Modern UI Controller
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Optional API token. Only needed when the backend has API_AUTH_TOKEN set.
+// Stored locally so it is never sent to the model or logged.
+function getApiToken() {
+  try { return localStorage.getItem('apiToken') || ''; } catch (_) { return ''; }
+}
+
+// Merge the optional Authorization header into a fetch options object.
+function withAuth(opts = {}) {
+  const token = getApiToken();
+  if (!token) return opts;
+  return { ...opts, headers: { ...(opts.headers || {}), 'Authorization': `Bearer ${token}` } };
+}
+
 async function api(path, opts) {
-  const res = await fetch(path, opts);
+  const res = await fetch(path, withAuth(opts));
   if (!res.ok) {
     const txt = await res.text();
     throw new Error(`${res.status} ${res.statusText}: ${txt}`);
@@ -184,7 +197,7 @@ async function streamChatQuery(query) {
   const model = modelEl ? modelEl.value || null : null;
   const payload = { query, model, history };
 
-  const res = await fetch('/chat/stream', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  const res = await fetch('/chat/stream', withAuth({ method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) }));
   if (!res.ok) {
     const txt = await res.text();
     throw new Error(`${res.status} ${res.statusText}: ${txt}`);
@@ -485,6 +498,8 @@ function settingsEl(id) {
 }
 
 async function loadSettings() {
+  const tokenInput = document.getElementById('cfg_api_token');
+  if (tokenInput) tokenInput.value = getApiToken();
   try {
     const data = await api('/settings');
     for (const field of SETTING_FIELDS) {
@@ -505,6 +520,16 @@ async function loadSettings() {
 }
 
 async function saveSettings() {
+  // The API token is a browser-local credential, not a server .env field.
+  const tokenInput = document.getElementById('cfg_api_token');
+  if (tokenInput) {
+    try {
+      const t = tokenInput.value.trim();
+      if (t) localStorage.setItem('apiToken', t);
+      else localStorage.removeItem('apiToken');
+    } catch (_) { /* ignore storage errors */ }
+  }
+
   const payload = {};
   for (const field of SETTING_FIELDS) {
     const el = settingsEl(field);

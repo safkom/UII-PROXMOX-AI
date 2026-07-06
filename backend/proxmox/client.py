@@ -20,10 +20,14 @@ class ProxmoxClient:
         self.session.headers.update({
             "Authorization": settings.proxmox_auth_header,
         })
+        # (connect, read) timeout so a hung/unreachable PVE host cannot block
+        # the worker thread indefinitely. Callers may override via kwargs.
+        self._timeout = (5, getattr(settings, "proxmox_request_timeout", 15))
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
         """Make an authenticated request to Proxmox API."""
         url = f"{self.base_url}/{path.lstrip('/')}"
+        kwargs.setdefault("timeout", self._timeout)
         try:
             response = self.session.request(method, url, **kwargs)
             response.raise_for_status()

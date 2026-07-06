@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     proxmox_pve_auth_cookie: str | None = Field(default=None)
     proxmox_pve_csrf_token: str | None = Field(default=None)
     proxmox_verify_ssl: bool = Field(False)
+    proxmox_request_timeout: int = Field(15)
+    proxmox_ssh_strict_host_key: bool = Field(False)
 
     qdrant_url: str = Field(...)
     qdrant_api_key: str = Field("")
@@ -44,6 +46,11 @@ class Settings(BaseSettings):
     loki_url: str = Field(...)
     prometheus_url: str = Field(...)
     approval_db_path: str = Field("data/approvals.sqlite3")
+
+    # Optional API authentication. When set, every request must present a
+    # matching bearer token / X-API-Key header. Empty (default) keeps the
+    # trusted-LAN, no-auth behavior documented in the README.
+    api_auth_token: str | None = Field(default=None)
 
     @property
     def proxmox_token_name(self) -> str:

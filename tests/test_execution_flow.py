@@ -58,10 +58,28 @@ class FakeApprovalStore:
         item["review_note"] = note
         return item
 
+    def claim_for_execution(self, approval_id):
+        item = self._store.get(approval_id)
+        if not item or item["status"] != "approved":
+            return None
+        item["updated_at"] = datetime.now(timezone.utc)
+        item["status"] = "executing"
+        return item
+
+    def release_claim(self, approval_id, note=None):
+        item = self._store.get(approval_id)
+        if not item or item["status"] != "executing":
+            return item
+        item["updated_at"] = datetime.now(timezone.utc)
+        item["status"] = "approved"
+        if note:
+            item["review_note"] = note
+        return item
+
     def mark_executed(self, approval_id, note=None):
         item = self._store.get(approval_id)
-        if not item:
-            return None
+        if not item or item["status"] != "executing":
+            return item
         item["updated_at"] = datetime.now(timezone.utc)
         item["status"] = "executed"
         if note:
@@ -170,6 +188,97 @@ def test_command_validation_allowlist():
         service.validate("cat /etc/passwd | grep root")
     with pytest.raises(ValueError):
         service.validate("/usr/bin/df -h")
+
+
+def test_find_dangerous_flags_blocked():
+    service = ExecutionService()
+
+    # `find` is allowed for read-only searches...
+    assert service.validate("find /var/log -name '*.log'")[0] == "find"
+    assert service.validate("find /etc -type f") == ["find", "/etc", "-type", "f"]
+
+    # ...but its command-execution / destructive flags must be rejected, even
+    # though they contain no shell metacharacters and `rm` is only nested.
+    for cmd in [
+        "find / -delete",
+        "find / -name x -exec rm -rf {} +",
+        "find . -execdir touch pwned +",
+        "find / -type f -fprintf /tmp/out %p",
+        "find / -fls /tmp/list",
+    ]:
+        with pytest.raises(ValueError):
+            service.validate(cmd)
+
+
+def test_claim_prevents_double_execution(tmp_path):
+    from backend.approvals.store import ApprovalStore
+
+    store = ApprovalStore(db_path=str(tmp_path / "approvals.sqlite3"))
+    item = store.create("tail_logs", "tail -n 1 /etc/hosts", None, "low", None, "tester")
+    store.decide(item["id"], "approved", "admin", "ok")
+
+    # First claim wins and flips approved -> executing.
+    first = store.claim_for_execution(item["id"])
+    assert first is not None
+    assert first["status"] == "executing"
+
+    # A concurrent second claim on the same approval must fail (TOCTOU closed).
+    second = store.claim_for_execution(item["id"])
+    assert second is None
+
+    # Finalize and confirm it cannot be claimed again.
+    store.mark_executed(item["id"], note="done")
+    assert store.get(item["id"])["status"] == "executed"
+    assert store.claim_for_execution(item["id"]) is None
+
+
+def test_execute_conflict_on_double_run(monkeypatch):
+    client = TestClient(app)
+
+    fake_store = FakeApprovalStore()
+    monkeypatch.setattr(routes_mod, "approval_store", fake_store)
+
+    created = fake_store.create("tail_logs", "tail -n 1 /etc/hosts", None, "low", None, "tester")
+    fake_store.decide(created["id"], "approved", "admin", "ok")
+
+    monkeypatch.setattr(routes_mod.exec_service, "execute",
+                        lambda cmd, target, timeout=30: {"returncode": 0, "stdout": "ok", "stderr": ""})
+
+    # First execution succeeds and marks the approval executed.
+    resp = client.post("/execute", json={"approval_id": created["id"]})
+    assert resp.status_code == 200
+
+    # Second execution of the same approval is refused with 409.
+    resp = client.post("/execute", json={"approval_id": created["id"]})
+    assert resp.status_code == 409
+
+
+def test_api_auth_optional_token(monkeypatch):
+    from backend.config.settings import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "api_auth_token", "s3cret", raising=False)
+    client = TestClient(app)
+
+    # Missing token -> 401
+    assert client.get("/settings").status_code == 401
+    # Wrong token -> 401
+    assert client.get("/settings", headers={"Authorization": "Bearer nope"}).status_code == 401
+    # Correct bearer token -> passes auth (200)
+    assert client.get("/settings", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+    # X-API-Key header also accepted
+    assert client.get("/settings", headers={"X-API-Key": "s3cret"}).status_code == 200
+
+
+def test_api_auth_disabled_by_default(monkeypatch):
+    from backend.config.settings import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "api_auth_token", None, raising=False)
+    client = TestClient(app)
+
+    # No token configured -> open (back-compat trusted-LAN mode)
+    assert client.get("/settings").status_code == 200
 
 
 def test_proxmox_ip_builds_api_base_url():
